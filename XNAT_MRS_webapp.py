@@ -1,7 +1,6 @@
-# app.py — Flask web‑app for bulk uploading *.rda* resources to XNAT
+#XNAT_MRS_webapp.py — Flask web‑app for bulk uploading .rda & .dat spectroscopy resources to XNAT
 # ====================================================================
-"""Drag‑and‑drop Siemens `.rda` files straight into XNAT
-
+"""
 Quick start
 ~~~~~~~~~~
 ```bash
@@ -22,13 +21,16 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import timedelta, datetime
-from typing import Dict, List, Optional, Tuple
+from datetime import timedelta
+from typing import Dict, List, Optional, Tuple, Any
 import json
 import time
 from socket import timeout as SocketTimeout
-
-
+from dataclasses import dataclass
+from typing import Optional
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Graceful Flask import
@@ -248,7 +250,7 @@ UPLOAD_HTML = """
       </div>
 
       {% with messages=get_flashed_messages() %}
-        {% for msg in messages %}<div class="flash">{{ msg|safe }}</div>{% endfor %}
+        {% for msg in messages %}<div class="flash">{{ msg}}</div>{% endfor %}
       {% endwith %}
 
       <form id="uploadForm" method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" novalidate>
@@ -545,400 +547,6 @@ window.addEventListener('DOMContentLoaded', function(){
 </html>
 """
 
-# UPLOAD_HTML = """
-# <!doctype html><html lang=en><head><meta charset=utf-8>
-# <title>Raw Spectroscopy Data XNAT Uploader</title>
-# <style>
-#   body {
-#     font-family: sans-serif;
-#     max-width: 90rem;
-#     margin: 2rem auto;
-#     padding: 0 2rem;
-#   }
-
-#   label { display: block; margin-top: 0.6rem; }
-#   input[type=text], input[type=file] {
-#     width: 100%;
-#     padding: 0.45rem;
-#     box-sizing: border-box;
-#   }
-
-#   button {
-#     margin-top: 1.2rem;
-#     padding: 0.6rem 1.2rem;
-#     font-size: 1rem;
-#     cursor: pointer;
-#   }
-
-#   .flash {
-#     background: #eef;
-#     border: 1px solid #ccd;
-#     padding: 0.8rem;
-#     margin-top: 1rem;
-#   }
-
-#   /* Spinner overlay */
-#   #spinner-overlay {
-#     display: none;
-#     position: fixed;
-#     inset: 0;
-#     background: rgba(255,255,255,0.85);
-#     z-index: 9999;
-#     justify-content: center;
-#     align-items: center;
-#     font-size: 1.25rem;
-#     color: #333;
-#     gap: 0.75rem;
-#   }
-
-#   .spinner {
-#     border: 6px solid #ccc;
-#     border-top: 6px solid #333;
-#     border-radius: 50%;
-#     width: 2.5rem;
-#     height: 2.5rem;
-#     animation: spin 1s linear infinite;
-#   }
-#   @keyframes spin { to { transform: rotate(360deg); } }
-
-#   /* File table */
-#   table.file-table {
-#     width: 100%;
-#     border-collapse: collapse;
-#     table-layout: fixed;
-#     margin-top: 1rem;
-#   }
-#   table.file-table colgroup col:nth-child(1) { width: 25%; }
-#   table.file-table colgroup col:nth-child(2) { width: 8%; }
-#   table.file-table colgroup col:nth-child(3) { width: 25%; }
-#   table.file-table colgroup col:nth-child(4) { width: 10%; }
-#   table.file-table colgroup col:nth-child(5) { width: 10%; }
-#   table.file-table colgroup col:nth-child(6) { width: 10%; }
-#   table.file-table colgroup col:nth-child(7) { width: 5%; }
-
-#   table.file-table th,
-#   table.file-table td {
-#     border: 1px solid #ccc;
-#     padding: 0.4rem;
-#     vertical-align: middle;
-#   }
-
-#   table.file-table th {
-#     background: #f7f7f7;
-#     text-align: left;
-#   }
-
-#   table.file-table input[type="text"] {
-#     width: 100%;
-#     padding: 0.3rem;
-#     font-family: monospace;
-#     overflow: hidden;
-#     text-overflow: ellipsis;
-#     white-space: nowrap;
-#   }
-
-#   table.file-table input[readonly] {
-#     background: #f8f8f8;
-#   }
-
-#   .remove-btn {
-#     display: inline-flex;
-#     align-items: center;
-#     justify-content: center;
-#     width: 2rem;
-#     height: 2rem;
-#     border: none;
-#     background: transparent;
-#     font-size: 1.2rem;
-#     color: #a00;
-#     cursor: pointer;
-#   }
-#   .remove-btn:hover { color: #d00; }
-# </style>
-
-# <script>
-# let previewWins = [];
-# // Indexes to propagate RDA edits to matched DAT rows
-# const rdaRowByKey = new Map();   // seriesKey -> <tr> (RDA)
-# const datRowsByKey = new Map();  // seriesKey -> [<tr>, ...] (DATs)
-
-# // ---------- utility helpers ----------
-# function sanitize(txt) {
-#   return txt.trim().replace(/\\W+/g, "_").replace(/^_|_$/g, "");
-# }
-# function normSeriesKey(txt){ return (txt||"").toLowerCase().replace(/[_-]/g,""); }
-# function parseDatSeries(name){
-#   // meas_<MID>_<FID>_<series desc>.dat
-#   const m = name.match(/^meas_[^_]+_[^_]+_(.+)\\.dat$/i);
-#   return m ? m[1] : "";
-# }
-# function readFileText(file){
-#   return new Promise((resolve,reject)=>{
-#     const r = new FileReader();
-#     r.onload = e => resolve(String(e.target.result||""));
-#     r.onerror = reject;
-#     r.readAsText(file);
-#   });
-# }
-# function parseRDA(text){
-#   const start = '>>> Begin of header <<<';
-#   const end   = '>>> End of header <<<';
-#   const a = text.indexOf(start), b = text.indexOf(end);
-#   if (a === -1 || b === -1) return {};
-#   const lines = text.slice(a + start.length, b).split(/\\r?\\n/);
-#   const dict = {};
-#   for (const ln of lines) {
-#     const i = ln.indexOf(':');
-#     if (i > 0) dict[ln.slice(0, i).trim()] = ln.slice(i + 1).trim();
-#   }
-#   return dict;
-# }
-
-# // ---------- table row helpers ----------
-# function rowVals(row){
-#   return {
-#     project: row.querySelector("input[name='project_ids']").value.trim(),
-#     subject: row.querySelector("input[name='subject_labels']").value.trim(),
-#     session: row.querySelector("input[name='experiment_labels']").value.trim(),
-#     scan:    row.querySelector("input[name='scan_ids']").value.trim(),
-#   };
-# }
-
-# function propagateFromRda(key){
-#   const src = rdaRowByKey.get(key);
-#   if (!src) return;
-#   const vals = rowVals(src);
-#   const targets = datRowsByKey.get(key) || [];
-#   for (const row of targets){
-#     // only update DAT fields that aren't marked dirty
-#     for (const [name, value] of Object.entries({
-#       project_ids: vals.project,
-#       subject_labels: vals.subject,
-#       experiment_labels: vals.session,
-#       scan_ids: vals.scan,
-#     })){
-#       const inp = row.querySelector(`input[name='${name}']`);
-#       if (!inp) continue;
-#       if (inp.dataset.dirty === "1") continue;
-#       inp.value = value;
-#       inp.title = value;
-#     }
-#   }
-# }
-
-# function addRow(kind, fileName, meta){
-#   // kind: 'rda' or 'dat'
-#   // meta: {scan, series, project, subject, session, key}
-#   const tbody = document.getElementById('fileTableBody');
-#   const row = document.createElement('tr');
-#   row.dataset.kind = kind;
-#   row.dataset.seriesKey = meta.key || "";
-#   row.dataset.filename = fileName;
-
-#   function mkCell(name, val, readonly=false){
-#     const td = document.createElement('td');
-#     const inp = document.createElement('input');
-#     inp.type = 'text';
-#     inp.name = name;
-#     inp.value = val || '';
-#     inp.title = val || '';
-#     if (readonly) inp.readOnly = true;
-#     // mark DAT fields as dirty if user edits so we don't overwrite
-#     if (kind === 'dat' && !readonly){
-#       inp.addEventListener('input', ()=> { inp.dataset.dirty = '1'; });
-#     }
-#     td.appendChild(inp);
-#     return td;
-#   }
-
-#   row.appendChild(mkCell('file_names', fileName, true));
-#   row.appendChild(mkCell('scan_ids', meta.scan ?? ''));
-#   row.appendChild(mkCell('series_descs', meta.series ?? ''));
-#   row.appendChild(mkCell('project_ids', meta.project ?? ''));
-#   row.appendChild(mkCell('subject_labels', meta.subject ?? ''));
-#   row.appendChild(mkCell('experiment_labels', meta.session ?? ''));
-
-#   // remove button
-#   const tdRemove = document.createElement('td');
-#   const btn = document.createElement('button');
-#   btn.type = 'button';
-#   btn.className = 'remove-btn';
-#   btn.textContent = '❌';
-#   btn.addEventListener('click', ()=> {
-#     const key = row.dataset.seriesKey;
-#     if (row.dataset.kind === 'rda'){ rdaRowByKey.delete(key); }
-#     if (row.dataset.kind === 'dat'){
-#       const arr = datRowsByKey.get(key) || [];
-#       datRowsByKey.set(key, arr.filter(r => r !== row));
-#     }
-#     row.remove();
-#   });
-#   tdRemove.appendChild(btn);
-#   row.appendChild(tdRemove);
-
-#   tbody.appendChild(row);
-
-#   // wire RDA edits → propagate to DATs
-#   const key = row.dataset.seriesKey;
-#   if (kind === 'rda'){
-#     rdaRowByKey.set(key, row);
-#     for (const sel of ["project_ids","subject_labels","experiment_labels","scan_ids"]){
-#       row.querySelector(`input[name='${sel}']`).addEventListener('input', ()=>{
-#         propagateFromRda(key);
-#       });
-#     }
-#     // initial propagate
-#     propagateFromRda(key);
-#   } else {
-#     const arr = datRowsByKey.get(key) || [];
-#     arr.push(row);
-#     datRowsByKey.set(key, arr);
-#   }
-# }
-
-# // ---------- file handling ----------
-# async function handleFiles(fileList){
-#   const files = Array.from(fileList);
-
-#   // reset table + indexes
-#   document.getElementById('fileTableBody').innerHTML = '';
-#   rdaRowByKey.clear(); datRowsByKey.clear();
-
-#   // 1) Parse all RDAs first
-#   const rdaFiles = files.filter(f => f.name.toLowerCase().endsWith('.rda'));
-#   const rdaInfos = [];
-#   for (const f of rdaFiles){
-#     const txt = await readFileText(f);
-#     const hdr = parseRDA(txt);
-#     const meta = {
-#       scan: (hdr.SeriesNumber||'').trim(),
-#       series: (hdr.SeriesDescription||'').trim(),
-#       project: sanitize(hdr.StudyDescription||''),
-#       subject: sanitize(hdr.PatientName||''),
-#       session: sanitize(hdr.PatientID||''),
-#       key: normSeriesKey(hdr.SeriesDescription||''),
-#     };
-#     rdaInfos.push({ file: f, meta });
-#   }
-#   // add RDA rows
-#   for (const {file, meta} of rdaInfos){
-#     addRow('rda', file.name, meta);
-#   }
-
-#   // map for quick RDA lookup by normalized series key
-#   const rdaMetaByKey = new Map(
-#     rdaInfos.filter(x => x.meta.key).map(x => [x.meta.key, x.meta])
-#   );
-
-#   // 2) Now add DAT rows, inheriting from the matched RDA series (if found)
-#   const datFiles = files.filter(f => f.name.toLowerCase().endsWith('.dat'));
-#   for (const f of datFiles){
-#     const seriesRaw = parseDatSeries(f.name);
-#     const key = normSeriesKey(seriesRaw);
-#     const rdaMeta = rdaMetaByKey.get(key) || {
-#       scan:'', series:seriesRaw, project:'', subject:'', session:'', key
-#     };
-#     const meta = {
-#       scan: rdaMeta.scan,
-#       series: rdaMeta.series || seriesRaw,
-#       project: rdaMeta.project,
-#       subject: rdaMeta.subject,
-#       session: rdaMeta.session,
-#       key
-#     };
-#     addRow('dat', f.name, meta);
-#   }
-# }
-
-# // ---------- preview (opens tabs based on current table values) ----------
-# function openXNATPreviewsFromTable() {
-#   const rows = document.querySelectorAll('#fileTableBody tr');
-#   const uniq = new Set();
-#   for (const row of rows) {
-#     const p = row.querySelector("input[name='project_ids']").value.trim();
-#     const s = row.querySelector("input[name='subject_labels']").value.trim();
-#     const e = row.querySelector("input[name='experiment_labels']").value.trim();
-#     if (p && s && e) uniq.add(`${p}|||${s}|||${e}`);
-#   }
-#   const xnatBase = {{ XNAT_BASE_URL | tojson }};
-#   previewWins = [];
-#   for (const key of uniq) {
-#     const [p, s, e] = key.split("|||");
-#     const url = `${xnatBase.replace(/\\/$/,'')}/data/projects/${encodeURIComponent(p)}/subjects/${encodeURIComponent(s)}/experiments/${encodeURIComponent(e)}`;
-#     const w = window.open(url, '_blank');
-#     if (w) previewWins.push(w);
-#   }
-# }
-
-# // ---------- DOM ready ----------
-# window.addEventListener('DOMContentLoaded', () => {
-#   const fileInput = document.getElementById('rda_input');
-#   const form = document.getElementById('uploadForm');
-
-#   fileInput.addEventListener('change', e => { handleFiles(e.target.files); });
-#   document.getElementById('preview_xnat_btn').addEventListener('click', openXNATPreviewsFromTable);
-
-#   form.addEventListener('submit', () => {
-#     if (previewWins && previewWins.length) {
-#       previewWins.forEach(w => { try { if (w && !w.closed) w.close(); } catch {} });
-#     }
-#     document.getElementById('spinner-overlay').style.display = 'flex';
-#   });
-
-#   {% if reload_urls %}
-#   try {
-#     const urls = {{ reload_urls | tojson }};
-#     for (const url of urls) {
-#       const win = window.open(url, '_blank');
-#       if (win) win.focus();
-#     }
-#   } catch (e) { console.warn('XNAT reload failed:', e); }
-#   {% endif %}
-# });
-# </script>
-# </head><body>
-#   <p style="float:right"><a href="{{url_for('logout')}}">Logout</a></p>
-#   <h2>Upload .rda and .dat files to XNAT</h2>
-
-#   {% with messages=get_flashed_messages() %}
-#     {% for msg in messages %}
-#       <div class="flash">{{ msg|safe }}</div>
-#     {% endfor %}
-#   {% endwith %}
-
-#   <form id="uploadForm" method="post" action="{{url_for('upload')}}" enctype="multipart/form-data">
-#     <label>Select .rda and .dat file(s)
-#       <input id="rda_input" name="files" type="file" accept=".rda,.dat" multiple required>
-#     </label>
-
-#     <table class="file-table">
-#       <colgroup><col><col><col><col><col><col><col></colgroup>
-#       <thead>
-#         <tr>
-#           <th>Filename</th>
-#           <th>Scan&nbsp;ID</th>
-#           <th>Series&nbsp;Description</th>
-#           <th>Project</th>
-#           <th>Subject</th>
-#           <th>Session</th>
-#           <th></th>
-#         </tr>
-#       </thead>
-#       <tbody id="fileTableBody"></tbody>
-#     </table>
-
-#     <button type="button" id="preview_xnat_btn">👁 Preview XNAT Session(s)</button>
-#     <button type="submit">Upload</button>
-#   </form>
-
-#   <div id="spinner-overlay">
-#     <div class="spinner"></div>
-#     Uploading…
-#   </div>
-# </body></html>
-# """
-
-
 # ---------------------------------------------------------------------------
 # Backend helpers
 # ---------------------------------------------------------------------------
@@ -952,18 +560,60 @@ def _session_creds() -> Tuple[str, str]:
         raise RuntimeError("Not logged in")
     return session["xnat_user"], session["xnat_pass"]
 
-
 def _check_credentials(user: str, pwd: str) -> bool:
     url = f"{XNAT_BASE_URL}/data/projects?limit=1"
-    return 200 <= _request('GET', url, None, auth=(user, pwd)) < 300
+    result = _request("GET", url, None, auth=(user, pwd), timeout=15)
+    return bool(result.ok and result.status is not None and 200 <= result.status < 300)
+
+
+def _init_logging() -> None:
+    logdir = Path.home() / ".xnat_uploader"
+    logdir.mkdir(exist_ok=True)
+
+    logfile = logdir / "uploader.log"
+
+    handler = RotatingFileHandler(
+        logfile,
+        maxBytes=2_000_000,   # ~2 MB
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+
+_init_logging()
+
+@dataclass
+class RequestResult:
+    ok: bool
+    status: Optional[int] = None
+    error_type: Optional[str] = None   # "network", "timeout", "http", "auth"
+    message: Optional[str] = None
+
+class UserFacingError(RuntimeError):
+    """Error with a message safe to show to end users."""
+    pass
+
 
 def _request(method: str, url: str, data: bytes | None,
              auth: Tuple[str, str] | None = None,
-             timeout: int | None = None) -> int:
-    """Return HTTP status code. On network error, return 599."""
+             timeout: int | None = None) -> RequestResult:
+    """
+    Perform an HTTP request with retries.
+
+    Returns a RequestResult with enough detail to present
+    a user-friendly error message.
+    """
     user, pwd = auth if auth else _session_creds()
     req = urllib.request.Request(
-        url, data=data, method=method,
+        url,
+        data=data,
+        method=method,
         headers={
             "Authorization": _basic_auth_header(user, pwd),
             "Accept": "application/json",
@@ -977,23 +627,59 @@ def _request(method: str, url: str, data: bytes | None,
     for attempt in range(tries):
         try:
             with urllib.request.urlopen(req, timeout=to) as resp:  # type: ignore[arg-type]
-                return resp.status
+                return RequestResult(ok=True, status=resp.status)
+
         except urllib.error.HTTPError as err:
-            # HTTPError is a valid HTTP response (e.g. 4xx/5xx) — return code
-            return err.code 
-        except (urllib.error.URLError, SocketTimeout) as err:
-            # Transient network/timeout: retry unless last attempt
+            # HTTPError is a valid HTTP response (4xx/5xx)
+            if err.code in (401, 403):
+                return RequestResult(
+                    ok=False,
+                    status=err.code,
+                    error_type="auth",
+                    message="Authentication with XNAT failed. Please log in again."
+                )
+
+            return RequestResult(
+                ok=False,
+                status=err.code,
+                error_type="http",
+                message=f"XNAT returned HTTP {err.code}."
+            )
+
+        except SocketTimeout:
             if attempt < tries - 1:
-                time.sleep((backoff ** attempt))
+                time.sleep(backoff ** attempt)
                 continue
-            # Signal network failure with 599 (like curl's 5xx-ish sentinel)
-            return 599
+
+            return RequestResult(
+                ok=False,
+                error_type="timeout",
+                message="Network timeout while contacting XNAT."
+            )
+
+        except urllib.error.URLError:
+            if attempt < tries - 1:
+                time.sleep(backoff ** attempt)
+                continue
+
+            return RequestResult(
+                ok=False,
+                error_type="network",
+                message="Network error while contacting XNAT."
+            )
+
+    # Should not be reachable, but keep a safe fallback
+    return RequestResult(
+        ok=False,
+        error_type="unknown",
+        message="Unexpected error while contacting XNAT."
+    )
 
 def _ensure_resource(base: str, label: str) -> None:
     _request("PUT", f"{base}/resources/{label}", data=b"")
 
 # ---------------------------------------------------------------------------
-# NEW helper that returns the decoded JSON body
+# helper that returns the decoded JSON body
 # ---------------------------------------------------------------------------
 def _request_json(url: str,
                   auth: Tuple[str, str] | None = None,
@@ -1006,22 +692,67 @@ def _request_json(url: str,
                  "Accept": "application/json"}
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.load(resp)          # ← json.load() reads & parses in one go
+        return json.load(resp)          
 
 
 # ---------------------------------------------------------------------------
 # Convenience wrapper for the dicomdump call
 # ---------------------------------------------------------------------------
+
 def dicom_field(base: str, scan_src: str, field: str,
                 auth: Tuple[str, str] | None = None) -> str:
-    """
-    Return the raw value of a DICOM tag (e.g. ImageType, StudyDate)
-    for a particular scan in XNAT.
-    """
-    query = urllib.parse.urlencode({"src": scan_src, "field": field})  # handles & safely
-    result = _request_json(f"{base}/data/services/dicomdump?{query}", auth=auth)
-    return result["ResultSet"]["Result"][0]["value"]
+    query = urllib.parse.urlencode({"src": scan_src, "field": field})
+    url = f"{base}/data/services/dicomdump?{query}"
 
+    try:
+        result = _request_json(url, auth=auth)
+
+    except SocketTimeout as err:
+        raise UserFacingError(
+            "XNAT did not respond in time. Please try again."
+        ) from err
+
+    except urllib.error.HTTPError as err:
+        if err.code in (401, 403):
+            raise UserFacingError(
+                "XNAT authentication failed or you do not have access to this project/scan. "
+                "Please log in again or verify permissions."
+            ) from err
+        if err.code == 404:
+            raise UserFacingError(
+                "XNAT could not find the specified project/subject/session/scan. "
+                "Please check the values in the table and try again."
+            ) from err
+        raise UserFacingError(
+            "XNAT returned an error while reading scan metadata. Please try again."
+        ) from err
+
+    except urllib.error.URLError as err:
+        # DNS failure, connection refused, TLS handshake, etc.
+        raise UserFacingError(
+            "Unable to reach XNAT. Please check your network connection and try again."
+        ) from err
+
+    except json.JSONDecodeError as err:
+        raise UserFacingError(
+            "XNAT returned an unexpected response while reading scan metadata. Please try again."
+        ) from err
+
+    # Payload interpretation (not network errors)
+    rows = result.get("ResultSet", {}).get("Result", [])
+    if not rows:
+        raise UserFacingError(
+            "XNAT could not find DICOM metadata for the selected scan. "
+            "Please check the project/subject/session/scan values and try again."
+        )
+
+    value = rows[0].get("value")
+    if value in (None, ""):
+        raise UserFacingError(
+            "XNAT returned incomplete DICOM metadata for the selected scan."
+        )
+
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -1043,15 +774,6 @@ def _parse_hdr(raw: bytes) -> Dict[str, str]:
 
 _sanitize = lambda t: re.sub(r"\W+", "_", t.strip()).strip("_")
 
-# def _norm_series_key(txt: str) -> str:
-#     """
-#     Return a normalised key where underscores, dashes and case
-#     differences no longer matter, e.g.
-#         'mrs-mrsref_acq-PRESS_voi-Lacc'  ->
-#         'mrsmrsrefacqpressvoilacc'
-#     """
-#     return re.sub(r'[_-]', '', txt).lower()
-
 # ---------------------------------------------------------------------------
 # ID derivation
 # ---------------------------------------------------------------------------
@@ -1064,7 +786,7 @@ def _derive_ids(
     s0: Optional[str],
     e0: Optional[str],
     sc0: Optional[int],
-    d0: Optional[str],              # ← NEW: expected StudyDate in YYYYMMDD (or None)
+    d0: Optional[str],              
 ) -> Tuple[str, str, str, int, str, List[str]]:
     """
     Pull identifying information from an RDA header.
@@ -1151,14 +873,6 @@ def upload():
     if "xnat_user" not in session:
         return redirect(url_for("login"))
 
-    rp = request.form
-    p0, s0, e0, sc0, d0 = (
-        rp.get("project_id") or None,
-        rp.get("subject_label") or None,
-        rp.get("experiment_label") or None,
-        rp.get("scan_id") or None,
-        rp.get("study_date") or None,
-    )
     label = "MRS"
     files = [f for f in request.files.getlist("files") if f and f.filename]
     if not files:
@@ -1176,7 +890,16 @@ def upload():
             continue
         blob = f.read()
         hdr = _parse_hdr(blob)
-        p, s, e, sc, d, _ = _derive_ids(blob, f.filename, p0, s0, e0, sc0, d0)
+        p, s, e, sc, d, _ = _derive_ids(
+            blob,
+            f.filename,
+            None,  # project default
+            None,  # subject default
+            None,  # session default
+            None,  # scan default
+            None,  # study_date default
+        )
+
         desc = hdr.get("SeriesDescription", "")
         rda_meta.append({
             "filename": f.filename,
@@ -1216,7 +939,7 @@ def upload():
             'scan_id': _to_int_or_none(scans[i].strip()) if i < len(scans) else None,
             'series_desc': (descs[i].strip() if i < len(descs) and descs[i].strip() else None),
         }
-        # sanitize IDs to match your existing behavior
+        # sanitize IDs 
         if ov['project']: ov['project'] = _sanitize(ov['project'])
         if ov['subject']: ov['subject'] = _sanitize(ov['subject'])
         if ov['session']: ov['session'] = _sanitize(ov['session'])
@@ -1277,17 +1000,8 @@ def upload():
         s  = ov.get('subject')     or meta['subject']
         e  = ov.get('session')     or meta['session']
         sc = ov.get('scan_id')     if ov.get('scan_id') is not None else meta['scan_id']
-        d  = meta['study_date']    # keep your parsed StudyDate for checks
+        d  = meta['study_date']    # keep parsed StudyDate for checks
         desc = ov.get('series_desc') or meta['series_desc']
-
-        # p, s, e, sc, d, desc = (
-        #     meta["project"],
-        #     meta["subject"],
-        #     meta["session"],
-        #     meta["scan_id"],
-        #     meta["study_date"],
-        #     meta["series_desc"],
-        # )
 
         # ------------------------------------------------------------------
         # DICOM validation: confirm spectroscopy + matching date
@@ -1297,8 +1011,16 @@ def upload():
             img_type = dicom_field(XNAT_BASE_URL, scan, "ImageType")
             study_dt = dicom_field(XNAT_BASE_URL, scan, "StudyDate")
             series_description = dicom_field(XNAT_BASE_URL, scan, "SeriesDescription")
-        except Exception as err:
-            bad.append(f"{name}: failed to read DICOM metadata ({err})")
+
+        except (urllib.error.URLError, SocketTimeout) as err:
+            err2 = UserFacingError("Network error while contacting XNAT.")
+            logging.warning("Network error validating DICOM for %s", name, exc_info=True)
+            bad.append(f"{name}: {err2} File was not uploaded.")
+            continue
+
+        except UserFacingError as err:
+            logging.warning("UserFacingError validating DICOM for %s", name, exc_info=True)
+            bad.append(f"{name}: {err} File was not uploaded.")
             continue
 
         if "SPECTROSCOPY" not in img_type.upper():
@@ -1306,7 +1028,7 @@ def upload():
             continue
 
         if study_dt != (d or study_dt):
-            bad.append(f"{name}: StudyDate mismatch — DICOM={study_dt}, RDA={d}")
+            bad.append(f"{name}: StudyDate mismatch: DICOM={study_dt}, RDA={d}")
             continue
 
         # ------------------------------------------------------------------
@@ -1318,30 +1040,66 @@ def upload():
 
         _ensure_resource(base, label)
         endpoint = f"{base}/resources/{label}/files/{urllib.parse.quote(name)}?inbody=true"
-        status = _request("PUT", endpoint, blob)
 
-        if 200 <= status < 300:
+        result = _request("PUT", endpoint, blob)
+
+        if result.ok:
             ok += 1
             seen_sessions.add((p, s, e))
             msgs.append(f"{name}: uploaded successfully (Scan {sc})")
+
         else:
-            bad.append(f"{name}: upload failed (HTTP {status})")
+            if result.error_type == "network":
+                bad.append(
+                    f"{name}: Network error — file was not uploaded. "
+                    "Please check your connection and try again."
+                )
+            elif result.error_type == "timeout":
+                bad.append(
+                    f"{name}: Upload timed out — file was not uploaded. "
+                    "Please try again."
+                )
+            elif result.error_type == "auth":
+                bad.append(
+                    f"{name}: Authentication error while uploading. "
+                    "Please log in again."
+                )
+            else:
+                # fallback (HTTP errors, unexpected cases)
+                code = result.status if result.status is not None else "unknown"
+                bad.append(f"{name}: upload failed (HTTP {code})")
 
     # ------------------------------------------------------------------
     # Flash results + reopen XNAT tabs
     # ------------------------------------------------------------------
+
+
+    # Summary banner 
+    if ok and bad:
+        flash(f"Upload finished with errors: {ok} uploaded, {len(bad)} failed.")
+    elif ok:
+        flash("Upload complete: all selected files were uploaded successfully.")
+    else:
+        flash("No files were uploaded. Please review the errors and try again.")
+
+
+    # show per-file success messages 
     for m in msgs:
         flash(m)
+
+    # Show failures as separate flash messages
+    for b in bad:
+        flash(b)
+
+    # Only reopen XNAT tabs if at least one upload succeeded
     if ok:
         session["xnat_reload_urls"] = [
             f"{XNAT_BASE_URL}/data/projects/{p}/subjects/{s}/experiments/{e}"
             for (p, s, e) in sorted(seen_sessions)
         ]
-        flash("<strong>Upload complete.</strong> Files successfully uploaded.")
-    if bad:
-        flash("<br>".join(bad))
 
     return redirect(url_for("index"))
+
 
 
 # ---------------------------------------------------------------------------
