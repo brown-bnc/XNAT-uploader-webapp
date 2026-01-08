@@ -31,6 +31,8 @@ from typing import Optional
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+import secrets
+import shutil
 
 # ---------------------------------------------------------------------------
 # Graceful Flask import
@@ -255,7 +257,7 @@ UPLOAD_HTML = """
 
       <form id="uploadForm" method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" novalidate>
         <label for="rda_input">Select .rda and .dat file(s)</label>
-        <input id="rda_input" name="files" type="file" accept=".rda,.dat" multiple required>
+        <input id="rda_input" name="files" type="file" accept=".rda,.dat" multiple>
 
         <div class="subtle" style="margin-top:.35rem;">
           TIP: RDA file headers are used to automatically determine Project, Subject, Session, & Scan. TWIX (.dat) files inherit this information
@@ -379,6 +381,13 @@ function addRow(kind, fileName, meta){
   row.dataset.kind = kind;
   row.dataset.seriesKey = meta.key || '';
   row.dataset.filename = fileName;
+
+  // hidden token: used to re-load staged bytes on retry (server-side)
+  const tok = document.createElement('input');
+  tok.type = 'hidden';
+  tok.name = 'file_tokens';
+  tok.value = meta.token || '';
+  row.appendChild(tok);
 
   function mkCell(name, val, readonly){
     const td = document.createElement('td');
@@ -520,6 +529,29 @@ window.addEventListener('DOMContentLoaded', function(){
   const form = document.getElementById('uploadForm');
   if (!fileInput){ err('#rda_input missing'); return; }
 
+  {% if pending_rows %}
+  try {
+    const rows = {{ pending_rows | tojson }};
+    const tbody = document.getElementById('fileTableBody');
+    tbody.innerHTML = '';
+    rdaRowByKey.clear(); datRowsByKey.clear();
+
+    rows.forEach(r => {
+      addRow(r.kind, r.filename, {
+        scan: r.scan_id || '',
+        series: r.series_desc || '',
+        project: r.project || '',
+        subject: r.subject || '',
+        session: r.session || '',
+        key: r.key || '',
+        token: r.token || ''
+      });
+    });
+  } catch (e) {
+    console.warn("Failed to restore pending rows", e);
+  }
+  {% endif %}
+
   fileInput.addEventListener('change', function(e){ handleFiles(e.target.files); });
   const prevBtn = document.getElementById('preview_xnat_btn');
   if (prevBtn) prevBtn.addEventListener('click', openXNATPreviewsFromTable);
@@ -587,6 +619,73 @@ def _init_logging() -> None:
     root.addHandler(handler)
 
 _init_logging()
+
+def _stage_dir() -> Path:
+    d = Path.home() / ".xnat_uploader" / "staged"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _stage_save_filestorage(fs) -> tuple[str, str]:
+    """
+    Save an incoming Werkzeug FileStorage to disk.
+    Returns (token, path).
+    """
+    token = secrets.token_urlsafe(16)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", (fs.filename or "upload"))
+    path = _stage_dir() / f"{token}__{safe_name}"
+    with open(path, "wb") as out:
+        try:
+            fs.stream.seek(0)
+        except Exception:
+            pass
+        shutil.copyfileobj(fs.stream, out)
+    return token, str(path)
+
+def _staged_info(token: str) -> dict:
+    info = session.get("pending_files", {}).get(token)
+    if not info:
+        raise UserFacingError("Staged file data expired. Please re-select your files and try again.")
+    return info
+
+def _staged_open(token: str):
+    info = _staged_info(token)
+    path = info.get("path")
+    if not path or not os.path.exists(path):
+        raise UserFacingError("Staged file is missing. Please re-select your files and try again.")
+    return open(path, "rb")
+
+def _staged_delete(token: str) -> None:
+    pending = session.get("pending_files", {})
+    info = pending.get(token)
+    if not info:
+        return
+    path = info.get("path")
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+    pending.pop(token, None)
+    session["pending_files"] = pending
+
+def _clear_all_staged_for_session() -> None:
+    """
+    Delete all staged files referenced by this session and clear session keys.
+    Safe to call multiple times.
+    """
+    pending = session.get("pending_files", {}) or {}
+    for tok, info in list(pending.items()):
+        path = info.get("path")
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+        pending.pop(tok, None)
+
+    session.pop("pending_files", None)
+    session.pop("pending_rows", None)
+
 
 @dataclass
 class RequestResult:
@@ -847,6 +946,9 @@ def _derive_ids(
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
+        # wipe any staged files from a prior session attempt
+        _clear_all_staged_for_session()
+
         user = request.form['username'].strip()
         pwd = request.form['password']
         if _check_credentials(user, pwd):
@@ -856,17 +958,26 @@ def login():
         flash('Invalid username or password')
     return render_template_string(LOGIN_HTML)
 
+
 @app.route('/logout')
 def logout():
+    _clear_all_staged_for_session()
     session.clear()
     return redirect(url_for('login'))
+
 
 @app.route('/')
 def index():
     if 'xnat_user' not in session:
         return redirect(url_for('login'))
     reload_urls = session.pop('xnat_reload_urls', [])
-    return render_template_string(UPLOAD_HTML, XNAT_BASE_URL=XNAT_BASE_URL, reload_urls=reload_urls)
+    pending_rows = session.get("pending_rows", [])
+    return render_template_string(
+        UPLOAD_HTML,
+        XNAT_BASE_URL=XNAT_BASE_URL,
+        reload_urls=reload_urls,
+        pending_rows=pending_rows,
+    )
 
 @app.route('/upload', methods=['POST'])
 def upload():
@@ -874,170 +985,196 @@ def upload():
         return redirect(url_for("login"))
 
     label = "MRS"
-    files = [f for f in request.files.getlist("files") if f and f.filename]
-    if not files:
-        flash("No files selected.")
-        return redirect(url_for("index"))
 
-    ok, bad, msgs = 0, [], []
-    rda_meta: list[dict] = []
-
-    # ------------------------------------------------------------------
-    # 1) Parse all RDAs first, capture per-file metadata
-    # ------------------------------------------------------------------
-    for f in files:
-        if not f.filename.lower().endswith(".rda"):
-            continue
-        blob = f.read()
-        hdr = _parse_hdr(blob)
-        p, s, e, sc, d, _ = _derive_ids(
-            blob,
-            f.filename,
-            None,  # project default
-            None,  # subject default
-            None,  # session default
-            None,  # scan default
-            None,  # study_date default
-        )
-
-        desc = hdr.get("SeriesDescription", "")
-        rda_meta.append({
-            "filename": f.filename,
-            "project": p,
-            "subject": s,
-            "session": e,
-            "scan_id": sc,
-            "series_desc": desc,
-            "study_date": d,
-        })
-        try:
-            f.stream.seek(0)
-        except Exception:
-            try: f.seek(0)
-            except Exception: pass
-
-    # --- Per-row overrides from the table (arrays align by row index) ---
+    # ---- Table arrays (these are the authoritative state) ----
     names = request.form.getlist('file_names')
     scans = request.form.getlist('scan_ids')
     descs = request.form.getlist('series_descs')
     projs = request.form.getlist('project_ids')
     subs  = request.form.getlist('subject_labels')
     exps  = request.form.getlist('experiment_labels')
+    toks  = request.form.getlist('file_tokens')  # hidden input per row
 
     def _to_int_or_none(x: Optional[str]) -> Optional[int]:
         try:
-            return int(x) if x and str(x).strip().isdigit() else None
+            x = (x or "").strip()
+            return int(x) if x.isdigit() else None
         except Exception:
             return None
 
-    overrides: dict[str, dict] = {}
-    for i, fname in enumerate(names):
-        ov = {
-            'project': (projs[i].strip() if i < len(projs) and projs[i].strip() else None),
-            'subject': (subs[i].strip()  if i < len(subs)  and subs[i].strip()  else None),
-            'session': (exps[i].strip()  if i < len(exps)  and exps[i].strip()  else None),
-            'scan_id': _to_int_or_none(scans[i].strip()) if i < len(scans) else None,
-            'series_desc': (descs[i].strip() if i < len(descs) and descs[i].strip() else None),
-        }
-        # sanitize IDs 
-        if ov['project']: ov['project'] = _sanitize(ov['project'])
-        if ov['subject']: ov['subject'] = _sanitize(ov['subject'])
-        if ov['session']: ov['session'] = _sanitize(ov['session'])
-        overrides[fname] = ov
+    # ------------------------------------------------------------
+    # Determine: first submit vs retry submit
+    # ------------------------------------------------------------
+    has_tokens = any(t.strip() for t in toks)
 
-    # ------------------------------------------------------------------
-    # 2) Helper for DAT ↔ RDA matching
-    # ------------------------------------------------------------------
+    if not has_tokens:
+        # FIRST SUBMIT: stage incoming files
+        incoming = [f for f in request.files.getlist("files") if f and f.filename]
+        if not incoming:
+            flash("No files selected.")
+            return redirect(url_for("index"))
+
+        pending_files: dict[str, dict] = {}
+        for fs in incoming:
+            token, path = _stage_save_filestorage(fs)
+            pending_files[token] = {"filename": fs.filename, "path": path}
+        session["pending_files"] = pending_files
+
+        # map filename -> token (assumes filenames are unique per batch)
+        fname_to_tok = {info["filename"]: tok for tok, info in pending_files.items()}
+        toks = [fname_to_tok.get(fn, "") for fn in names]
+
+    else:
+        # RETRY SUBMIT: must have staged files
+        if not session.get("pending_files"):
+            flash("Staged file data expired. Please re-select your files and try again.")
+            session.pop("pending_rows", None)
+            return redirect(url_for("index"))
+
+    # ------------------------------------------------------------
+    # Build row items from table (persisted on failure)
+    # ------------------------------------------------------------
+    row_items: list[dict] = []
+    for i, fname in enumerate(names):
+        row_items.append({
+            "token": (toks[i].strip() if i < len(toks) else ""),
+            "filename": fname,
+            "kind": "dat" if fname.lower().endswith(".dat") else "rda",
+            "scan_id": _to_int_or_none(scans[i]) if i < len(scans) else None,
+            "series_desc": (descs[i].strip() if i < len(descs) else ""),
+            "project": _sanitize(projs[i]) if i < len(projs) and projs[i].strip() else "",
+            "subject": _sanitize(subs[i])  if i < len(subs)  and subs[i].strip()  else "",
+            "session": _sanitize(exps[i])  if i < len(exps)  and exps[i].strip()  else "",
+            "key": "",  # optional
+        })
+
+    # Save current table state so the user never loses it
+    session["pending_rows"] = row_items
+
+    # ------------------------------------------------------------
+    # Parse RDA metadata from STAGED bytes (needed for DAT matching)
+    # ------------------------------------------------------------
+    rda_meta: list[dict] = []
+    for row in row_items:
+        if row["kind"] != "rda":
+            continue
+        tok = row["token"]
+        if not tok:
+            continue
+        try:
+            with _staged_open(tok) as fh:
+                blob = fh.read()
+        except UserFacingError:
+            # leave it to upload stage to error out nicely
+            continue
+
+        hdr = _parse_hdr(blob)
+        p, s, e, sc, d, _ = _derive_ids(blob, row["filename"], None, None, None, None, None)
+
+        rda_meta.append({
+            "token": tok,
+            "filename": row["filename"],
+            "project": row["project"] or p,
+            "subject": row["subject"] or s,
+            "session": row["session"] or e,
+            "scan_id": row["scan_id"] if row["scan_id"] is not None else sc,
+            "series_desc": row["series_desc"] or hdr.get("SeriesDescription", ""),
+            "study_date": d,
+        })
+
     def best_match(dat_name: str, rdas: list[dict]) -> Optional[dict]:
-        """Find best matching RDA entry for a DAT filename."""
         base = re.sub(r'[_-]', '', dat_name.lower())
         best = None
         for r in rdas:
-            if not r["series_desc"]:
+            if not r.get("series_desc"):
                 continue
             desc_norm = re.sub(r'[_-]', '', r["series_desc"].lower())
             score = 0
             if desc_norm in base or base in desc_norm:
                 score += 2
-            if str(r["scan_id"]) in dat_name:
+            if r.get("scan_id") is not None and str(r["scan_id"]) in dat_name:
                 score += 3
             if score and (not best or score > best[0]):
                 best = (score, r)
         return best[1] if best else None
 
-    # ------------------------------------------------------------------
-    # 3) Upload all files
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Upload per row; keep failures in pending_rows
+    # ------------------------------------------------------------
+    ok = 0
+    msgs: list[str] = []
+    bad: list[str] = []
+    failed_rows: list[dict] = []
     seen_sessions = set()
-    for f in files:
-        name = f.filename
-        ext = name.lower().rsplit(".", 1)[-1]
-        blob = f.read()
 
-        # ---------------- RDA ----------------
-        if ext == "rda":
-            meta = next((r for r in rda_meta if r["filename"] == name), None)
-            if not meta:
-                bad.append(f"{name}: could not parse RDA metadata")
-                continue
+    for row in row_items:
+        tok = row["token"]
+        name = row["filename"]
 
-        # ---------------- DAT ----------------
-        elif ext == "dat":
-            match = best_match(name, rda_meta)
-            if not match:
-                bad.append(f"{name}: no matching RDA found")
-                continue
-            meta = match
-
-        # ---------------- Unsupported ----------------
-        else:
-            bad.append(f"{name}: unsupported extension")
+        if not tok:
+            bad.append(f"{name}: Missing staged file token. Please re-select files and try again.")
+            failed_rows.append(row)
             continue
 
-        # Apply per-row overrides by filename (if provided)
-        ov = overrides.get(name, {})  # name is f.filename
-        p  = ov.get('project')     or meta['project']
-        s  = ov.get('subject')     or meta['subject']
-        e  = ov.get('session')     or meta['session']
-        sc = ov.get('scan_id')     if ov.get('scan_id') is not None else meta['scan_id']
-        d  = meta['study_date']    # keep parsed StudyDate for checks
-        desc = ov.get('series_desc') or meta['series_desc']
+        # Load staged bytes
+        try:
+            with _staged_open(tok) as fh:
+                blob = fh.read()
+        except UserFacingError as err:
+            bad.append(f"{name}: {err}")
+            failed_rows.append(row)
+            continue
 
-        # ------------------------------------------------------------------
-        # DICOM validation: confirm spectroscopy + matching date
-        # ------------------------------------------------------------------
+        # Determine metadata for this row
+        if row["kind"] == "rda":
+            meta = next((r for r in rda_meta if r["filename"] == name), None)
+            if not meta:
+                bad.append(f"{name}: Could not parse RDA metadata.")
+                failed_rows.append(row)
+                continue
+        else:
+            meta = best_match(name, rda_meta)
+            if not meta:
+                bad.append(f"{name}: No matching RDA found (cannot infer metadata).")
+                failed_rows.append(row)
+                continue
+
+        # Apply table overrides (already sanitized)
+        p = row["project"] or meta.get("project") or ""
+        s = row["subject"] or meta.get("subject") or ""
+        e = row["session"] or meta.get("session") or ""
+        sc = row["scan_id"] if row["scan_id"] is not None else meta.get("scan_id")
+        d = meta.get("study_date")
+
+        if not (p and s and e and sc is not None):
+            bad.append(f"{name}: Missing required Project/Subject/Session/Scan in the table.")
+            failed_rows.append(row)
+            continue
+
+        # DICOM validation
         scan = f"/archive/projects/{p}/subjects/{s}/experiments/{e}/scans/{sc}"
         try:
             img_type = dicom_field(XNAT_BASE_URL, scan, "ImageType")
             study_dt = dicom_field(XNAT_BASE_URL, scan, "StudyDate")
             series_description = dicom_field(XNAT_BASE_URL, scan, "SeriesDescription")
-
-        except (urllib.error.URLError, SocketTimeout) as err:
-            err2 = UserFacingError("Network error while contacting XNAT.")
-            logging.warning("Network error validating DICOM for %s", name, exc_info=True)
-            bad.append(f"{name}: {err2} File was not uploaded.")
-            continue
-
         except UserFacingError as err:
-            logging.warning("UserFacingError validating DICOM for %s", name, exc_info=True)
-            bad.append(f"{name}: {err} File was not uploaded.")
+            logging.warning("DICOM validation failed for %s", name, exc_info=True)
+            bad.append(f"{name}: {err}")
+            failed_rows.append(row)
             continue
 
-        if "SPECTROSCOPY" not in img_type.upper():
-            bad.append(f"{name}: Target DICOM '{series_description}' is not spectroscopy (ImageType='{img_type}')")
+        if "SPECTROSCOPY" not in (img_type or "").upper():
+            bad.append(f"{name}: Target DICOM '{series_description}' is not spectroscopy.")
+            failed_rows.append(row)
             continue
 
         if study_dt != (d or study_dt):
             bad.append(f"{name}: StudyDate mismatch: DICOM={study_dt}, RDA={d}")
+            failed_rows.append(row)
             continue
 
-        # ------------------------------------------------------------------
         # Upload
-        # ------------------------------------------------------------------
-        base = f"{XNAT_BASE_URL}/data/projects/{p}/subjects/{s}/experiments/{e}"
-        if sc:
-            base += f"/scans/{sc}"
-
+        base = f"{XNAT_BASE_URL}/data/projects/{p}/subjects/{s}/experiments/{e}/scans/{sc}"
         _ensure_resource(base, label)
         endpoint = f"{base}/resources/{label}/files/{urllib.parse.quote(name)}?inbody=true"
 
@@ -1047,34 +1184,29 @@ def upload():
             ok += 1
             seen_sessions.add((p, s, e))
             msgs.append(f"{name}: uploaded successfully (Scan {sc})")
-
+            _staged_delete(tok)  # delete staged file on success
         else:
             if result.error_type == "network":
-                bad.append(
-                    f"{name}: Network error — file was not uploaded. "
-                    "Please check your connection and try again."
-                )
+                bad.append(f"{name}: Network error uploading to XNAT. Please try again.")
             elif result.error_type == "timeout":
-                bad.append(
-                    f"{name}: Upload timed out — file was not uploaded. "
-                    "Please try again."
-                )
+                bad.append(f"{name}: Upload timed out. Please try again.")
             elif result.error_type == "auth":
-                bad.append(
-                    f"{name}: Authentication error while uploading. "
-                    "Please log in again."
-                )
+                bad.append(f"{name}: Authentication error uploading to XNAT. Please log in again.")
             else:
-                # fallback (HTTP errors, unexpected cases)
                 code = result.status if result.status is not None else "unknown"
                 bad.append(f"{name}: upload failed (HTTP {code})")
+            failed_rows.append(row)
 
-    # ------------------------------------------------------------------
-    # Flash results + reopen XNAT tabs
-    # ------------------------------------------------------------------
+    # Persist only failed rows so the table keeps them for retry
+    session["pending_rows"] = failed_rows
 
+    # If nothing failed, clear pending state entirely
+    if not failed_rows:
+        session.pop("pending_rows", None)
+        if not session.get("pending_files"):
+            session.pop("pending_files", None)
 
-    # Summary banner 
+    # Summary banner
     if ok and bad:
         flash(f"Upload finished with errors: {ok} uploaded, {len(bad)} failed.")
     elif ok:
@@ -1082,16 +1214,11 @@ def upload():
     else:
         flash("No files were uploaded. Please review the errors and try again.")
 
-
-    # show per-file success messages 
     for m in msgs:
         flash(m)
-
-    # Show failures as separate flash messages
     for b in bad:
         flash(b)
 
-    # Only reopen XNAT tabs if at least one upload succeeded
     if ok:
         session["xnat_reload_urls"] = [
             f"{XNAT_BASE_URL}/data/projects/{p}/subjects/{s}/experiments/{e}"
