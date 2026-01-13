@@ -21,18 +21,18 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import timedelta
+from datetime import timedelta, datetime
 from typing import Dict, List, Optional, Tuple, Any
 import json
 import time
 from socket import timeout as SocketTimeout
 from dataclasses import dataclass
-from typing import Optional
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import secrets
 import shutil
+from http.cookies import SimpleCookie
 
 # ---------------------------------------------------------------------------
 # Graceful Flask import
@@ -583,19 +583,72 @@ window.addEventListener('DOMContentLoaded', function(){
 # Backend helpers
 # ---------------------------------------------------------------------------
 
+def _get_jsession_from_response(resp, body_bytes: bytes) -> str:
+    """
+    XNAT may return the session id in the response body, and/or in Set-Cookie.
+    Prefer Set-Cookie if present; fall back to body.
+    """
+    # 1) Try Set-Cookie
+    set_cookie = resp.headers.get("Set-Cookie", "")
+    if set_cookie:
+        c = SimpleCookie()
+        c.load(set_cookie)
+        if "JSESSIONID" in c and c["JSESSIONID"].value:
+            return c["JSESSIONID"].value.strip()
+
+    # 2) Fall back to response body
+    body = (body_bytes or b"").decode("utf-8", errors="ignore").strip()
+    if body:
+        return body
+
+    raise UserFacingError("XNAT did not return a session token. Please try again.")
+
+
+def _xnat_login_jsession(user: str, pwd: str, timeout: int = 15) -> str:
+    """
+    Exchange username/password for an XNAT JSESSIONID.
+    Store only the JSESSIONID (not the password) in the Flask session.
+    """
+    url = f"{XNAT_BASE_URL}/data/JSESSION"
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": _basic_auth_header(user, pwd),
+            "Accept": "text/plain",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            return _get_jsession_from_response(resp, body)
+
+    except urllib.error.HTTPError as err:
+        if err.code in (401, 403):
+            raise UserFacingError("Invalid username/password or you do not have access to XNAT.") from err
+        raise UserFacingError("XNAT returned an error while logging in. Please try again.") from err
+
+    except (urllib.error.URLError, SocketTimeout) as err:
+        raise UserFacingError("Unable to reach XNAT. Please check your network connection and try again.") from err
+
+
 def _basic_auth_header(user: str, pwd: str) -> str:
     return "Basic " + base64.b64encode(f"{user}:{pwd}".encode()).decode()
 
 
-def _session_creds() -> Tuple[str, str]:
-    if "xnat_user" not in session or "xnat_pass" not in session:
+def _xnat_auth_headers(auth: Tuple[str, str] | None = None,
+                       jsession: str | None = None) -> dict[str, str]:
+    """
+    Prefer JSESSIONID cookie auth (Option A). Allow Basic auth only when explicitly passed
+    (e.g., during login to fetch JSESSIONID).
+    """
+    if auth is not None:
+        user, pwd = auth
+        return {"Authorization": _basic_auth_header(user, pwd)}
+    js = jsession or session.get("xnat_jsession")
+    if not js:
         raise RuntimeError("Not logged in")
-    return session["xnat_user"], session["xnat_pass"]
-
-def _check_credentials(user: str, pwd: str) -> bool:
-    url = f"{XNAT_BASE_URL}/data/projects?limit=1"
-    result = _request("GET", url, None, auth=(user, pwd), timeout=15)
-    return bool(result.ok and result.status is not None and 200 <= result.status < 300)
+    return {"Cookie": f"JSESSIONID={js}"}
 
 
 def _init_logging() -> None:
@@ -618,12 +671,36 @@ def _init_logging() -> None:
     root.setLevel(logging.INFO)
     root.addHandler(handler)
 
-_init_logging()
+
 
 def _stage_dir() -> Path:
     d = Path.home() / ".xnat_uploader" / "staged"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+def _cleanup_orphaned_staged_files(max_age_hours: int = 24) -> None:
+    """
+    Remove staged files left behind by crashed sessions / power loss / force quit.
+
+    Deletes any file in ~/.xnat_uploader/staged older than max_age_hours.
+    """
+    d = _stage_dir()
+    cutoff = time.time() - (max_age_hours * 3600)
+
+    removed = 0
+    for p in d.glob("*"):
+        try:
+            if not p.is_file():
+                continue
+            st = p.stat()
+            if st.st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except Exception:
+            logging.warning("Failed cleaning staged file: %s", p, exc_info=True)
+
+    if removed:
+        logging.info("Startup cleanup removed %d orphaned staged files", removed)
 
 def _stage_save_filestorage(fs) -> tuple[str, str]:
     """
@@ -687,6 +764,10 @@ def _clear_all_staged_for_session() -> None:
     session.pop("pending_rows", None)
 
 
+_init_logging()
+_cleanup_orphaned_staged_files(max_age_hours=int(os.getenv("STAGED_FILE_MAX_AGE_HOURS", "24")))
+
+
 @dataclass
 class RequestResult:
     ok: bool
@@ -698,25 +779,20 @@ class UserFacingError(RuntimeError):
     """Error with a message safe to show to end users."""
     pass
 
-
 def _request(method: str, url: str, data: bytes | None,
              auth: Tuple[str, str] | None = None,
+             jsession: str | None = None,
              timeout: int | None = None) -> RequestResult:
-    """
-    Perform an HTTP request with retries.
+    headers = {
+        **_xnat_auth_headers(auth=auth, jsession=jsession),
+        "Accept": "application/json",
+    }
 
-    Returns a RequestResult with enough detail to present
-    a user-friendly error message.
-    """
-    user, pwd = auth if auth else _session_creds()
     req = urllib.request.Request(
         url,
         data=data,
         method=method,
-        headers={
-            "Authorization": _basic_auth_header(user, pwd),
-            "Accept": "application/json",
-        },
+        headers=headers,
     )
 
     tries = max(1, XNAT_HTTP_RETRIES)
@@ -729,19 +805,13 @@ def _request(method: str, url: str, data: bytes | None,
                 return RequestResult(ok=True, status=resp.status)
 
         except urllib.error.HTTPError as err:
-            # HTTPError is a valid HTTP response (4xx/5xx)
             if err.code in (401, 403):
                 return RequestResult(
-                    ok=False,
-                    status=err.code,
-                    error_type="auth",
-                    message="Authentication with XNAT failed. Please log in again."
+                    ok=False, status=err.code, error_type="auth",
+                    message="XNAT session expired or you do not have access. Please log in again."
                 )
-
             return RequestResult(
-                ok=False,
-                status=err.code,
-                error_type="http",
+                ok=False, status=err.code, error_type="http",
                 message=f"XNAT returned HTTP {err.code}."
             )
 
@@ -749,30 +819,19 @@ def _request(method: str, url: str, data: bytes | None,
             if attempt < tries - 1:
                 time.sleep(backoff ** attempt)
                 continue
-
-            return RequestResult(
-                ok=False,
-                error_type="timeout",
-                message="Network timeout while contacting XNAT."
-            )
+            return RequestResult(ok=False, error_type="timeout",
+                                 message="Network timeout while contacting XNAT.")
 
         except urllib.error.URLError:
             if attempt < tries - 1:
                 time.sleep(backoff ** attempt)
                 continue
+            return RequestResult(ok=False, error_type="network",
+                                 message="Network error while contacting XNAT.")
 
-            return RequestResult(
-                ok=False,
-                error_type="network",
-                message="Network error while contacting XNAT."
-            )
+    return RequestResult(ok=False, error_type="unknown",
+                         message="Unexpected error while contacting XNAT.")
 
-    # Should not be reachable, but keep a safe fallback
-    return RequestResult(
-        ok=False,
-        error_type="unknown",
-        message="Unexpected error while contacting XNAT."
-    )
 
 def _ensure_resource(base: str, label: str) -> None:
     _request("PUT", f"{base}/resources/{label}", data=b"")
@@ -782,16 +841,15 @@ def _ensure_resource(base: str, label: str) -> None:
 # ---------------------------------------------------------------------------
 def _request_json(url: str,
                   auth: Tuple[str, str] | None = None,
+                  jsession: str | None = None,
                   timeout: int = 15) -> Any:
-    """GET `url` and return the parsed JSON response."""
-    user, pwd = auth if auth else _session_creds()
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": _basic_auth_header(user, pwd),
-                 "Accept": "application/json"}
-    )
+    headers = {
+        **_xnat_auth_headers(auth=auth, jsession=jsession),
+        "Accept": "application/json",
+    }
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.load(resp)          
+        return json.load(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -946,17 +1004,25 @@ def _derive_ids(
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        # wipe any staged files from a prior session attempt
         _clear_all_staged_for_session()
 
         user = request.form['username'].strip()
         pwd = request.form['password']
-        if _check_credentials(user, pwd):
-            session.permanent = True
-            session['xnat_user'], session['xnat_pass'] = user, pwd
-            return redirect(url_for('index'))
-        flash('Invalid username or password')
+
+        try:
+            js = _xnat_login_jsession(user, pwd, timeout=15)
+        except UserFacingError as err:
+            flash(str(err))
+            return render_template_string(LOGIN_HTML)
+
+        session.permanent = True
+        session['xnat_user'] = user          # optional (nice for auditing/logging)
+        session['xnat_jsession'] = js        # ✅ store only this
+        session.pop('xnat_pass', None)       # ✅ ensure no password sticks around
+        return redirect(url_for('index'))
+
     return render_template_string(LOGIN_HTML)
+
 
 
 @app.route('/logout')
@@ -964,6 +1030,7 @@ def logout():
     _clear_all_staged_for_session()
     session.clear()
     return redirect(url_for('login'))
+
 
 
 @app.route('/')
