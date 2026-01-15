@@ -291,7 +291,6 @@ UPLOAD_HTML = """
   </div>
 
   <div id="spinner-overlay"><div class="spinner"></div>Uploading…</div>
-
 <script>
 /* ===== Debug helpers: surface any runtime error ===== */
 window.addEventListener('error', e => console.error('JS Error:', e.message, e.error));
@@ -301,8 +300,17 @@ function err(){ try{ console.error.apply(console, arguments); }catch(_){} }
 
 /* ===== State maps ===== */
 let previewWins = [];
-const rdaRowByKey = new Map();
-const datRowsByKey = new Map();
+const rdaRowByKey = new Map();      // key -> rda <tr>
+const datRowsByKey = new Map();     // key -> [dat <tr>, ...]
+const rowByUid = new Map();         // uid -> <tr> (allows duplicate filenames)
+const rdaMetaByKey = new Map();     // key -> {scan,project,subject,session,series,key}  (series kept for RDA row only)
+
+/* ===== Accumulated local file selection (across multiple chooser actions) ===== */
+const selectedFiles = new Map();    // uid -> File
+
+function fileId(f){
+  return `${f.name}|||${f.size}|||${f.lastModified}`;
+}
 
 /* ===== Utils ===== */
 function sanitize(txt){ return String(txt||'').trim().replace(/\\W+/g,'_').replace(/^_|_$/g,''); }
@@ -316,12 +324,7 @@ function readFileText(file){
     const r = new FileReader();
     r.onload = e => resolve(String(e.target && e.target.result || ''));
     r.onerror = e => reject(e);
-    try {
-      // latin-1 improves robustness with Siemens headers
-      r.readAsText(file, 'ISO-8859-1');
-    } catch (_) {
-      r.readAsText(file); // fallback
-    }
+    try { r.readAsText(file, 'ISO-8859-1'); } catch (_) { r.readAsText(file); }
   });
 }
 function parseRDA(text){
@@ -346,41 +349,79 @@ function parseRDA(text){
 /* ===== Table helpers ===== */
 function rowVals(row){
   return {
-    project: (row.querySelector("input[name='project_ids']")||{}).value ? row.querySelector("input[name='project_ids']").value.trim() : '',
-    subject: (row.querySelector("input[name='subject_labels']")||{}).value ? row.querySelector("input[name='subject_labels']").value.trim() : '',
-    session: (row.querySelector("input[name='experiment_labels']")||{}).value ? row.querySelector("input[name='experiment_labels']").value.trim() : '',
-    scan:    (row.querySelector("input[name='scan_ids']")||{}).value ? row.querySelector("input[name='scan_ids']").value.trim() : ''
+    project: ((row.querySelector("input[name='project_ids']")||{}).value || '').trim(),
+    subject: ((row.querySelector("input[name='subject_labels']")||{}).value || '').trim(),
+    session: ((row.querySelector("input[name='experiment_labels']")||{}).value || '').trim(),
+    scan:    ((row.querySelector("input[name='scan_ids']")||{}).value || '').trim(),
+    series:  ((row.querySelector("input[name='series_descs']")||{}).value || '').trim()
   };
 }
+
+// Initial fill: only fill if empty AND not dirty
+function setIfEmptyAndNotDirty(row, fieldName, value){
+  const inp = row.querySelector(`input[name='${fieldName}']`);
+  if (!inp) return;
+  if (inp.dataset.dirty === "1") return;
+  if ((inp.value || '').trim()) return;  // only fill empty
+  const v = (value || '').toString();
+  inp.value = v;
+  inp.title = v;
+}
+
+// Propagation: overwrite if NOT dirty (even if non-empty)
+function setIfNotDirtyOverwrite(row, fieldName, value){
+  const inp = row.querySelector(`input[name='${fieldName}']`);
+  if (!inp) return;
+  if (inp.dataset.dirty === "1") return;
+  const v = (value || '').toString();
+  inp.value = v;
+  inp.title = v;
+}
+
+// overwrite=false: initial fill (empty only)
+// overwrite=true : propagate edits from RDA (overwrite non-dirty)
+// NOTE: We intentionally do NOT touch series_descs for DAT rows.
+function refreshDatMatchesForKey(key, overwrite){
+  const meta = rdaMetaByKey.get(key);
+  if (!meta) return;
+  const rows = datRowsByKey.get(key) || [];
+  const setter = overwrite ? setIfNotDirtyOverwrite : setIfEmptyAndNotDirty;
+
+  for (const row of rows){
+    setter(row, 'scan_ids', meta.scan ? String(meta.scan) : '');
+    setter(row, 'project_ids', meta.project ? String(meta.project) : '');
+    setter(row, 'subject_labels', meta.subject ? String(meta.subject) : '');
+    setter(row, 'experiment_labels', meta.session ? String(meta.session) : '');
+    // intentionally NOT updating 'series_descs'
+  }
+}
+
 function propagateFromRda(key){
   const src = rdaRowByKey.get(key);
   if (!src) return;
   const vals = rowVals(src);
-  const targets = datRowsByKey.get(key) || [];
-  for (var t=0; t<targets.length; t++){
-    const row = targets[t];
-    const fields = {
-      project_ids: vals.project,
-      subject_labels: vals.subject,
-      experiment_labels: vals.session,
-      scan_ids: vals.scan
-    };
-    for (var name in fields){
-      if (!Object.prototype.hasOwnProperty.call(fields, name)) continue;
-      const inp = row.querySelector("input[name='" + name + "']");
-      if (!inp) continue;
-      if (inp.dataset.dirty === "1") continue;
-      inp.value = fields[name]; inp.title = fields[name];
-    }
-  }
+
+  // keep meta map in sync with edits to RDA row
+  rdaMetaByKey.set(key, { ...vals, key });
+
+  // propagate edits to DAT rows (overwrite non-dirty)
+  refreshDatMatchesForKey(key, true);
 }
+
 function addRow(kind, fileName, meta){
   const tbody = document.getElementById('fileTableBody');
   if (!tbody){ err('tbody not found'); return; }
+
+  const uidVal = (meta.uid || '').trim();
+
+  // Prevent duplicates by UID (allows duplicate filenames)
+  if (uidVal && rowByUid.has(uidVal)) return;
+
   const row = document.createElement('tr');
   row.dataset.kind = kind;
   row.dataset.seriesKey = meta.key || '';
   row.dataset.filename = fileName;
+  row.dataset.uid = uidVal;
 
   // hidden token: used to re-load staged bytes on retry (server-side)
   const tok = document.createElement('input');
@@ -389,72 +430,113 @@ function addRow(kind, fileName, meta){
   tok.value = meta.token || '';
   row.appendChild(tok);
 
+  // hidden uid per row: backend uses to map row -> staged file even with duplicate filenames
+  const uid = document.createElement('input');
+  uid.type = 'hidden';
+  uid.name = 'row_uids';
+  uid.value = uidVal;
+  row.appendChild(uid);
+
   function mkCell(name, val, readonly){
     const td = document.createElement('td');
     const inp = document.createElement('input');
-    inp.type = 'text'; inp.name = name;
-    inp.value = val || ''; inp.title = val || '';
+    inp.type = 'text';
+    inp.name = name;
+    inp.value = val || '';
+    inp.title = val || '';
     if (readonly) inp.readOnly = true;
-    if (kind === 'dat' && !readonly){
+
+    // Track manual edits on all editable cells (so we don't overwrite them later)
+    if (!readonly){
       inp.addEventListener('input', function(){ inp.dataset.dirty = '1'; });
     }
+
     td.appendChild(inp);
     return td;
   }
 
   row.appendChild(mkCell('file_names', fileName, true));
-  row.appendChild(mkCell('scan_ids', meta.scan ? String(meta.scan) : ''));
-  row.appendChild(mkCell('series_descs', meta.series ? String(meta.series) : ''));
-  row.appendChild(mkCell('project_ids', meta.project ? String(meta.project) : ''));
-  row.appendChild(mkCell('subject_labels', meta.subject ? String(meta.subject) : ''));
-  row.appendChild(mkCell('experiment_labels', meta.session ? String(meta.session) : ''));
+  row.appendChild(mkCell('scan_ids', meta.scan ? String(meta.scan) : '', false));
+  row.appendChild(mkCell('series_descs', meta.series ? String(meta.series) : '', false));
+  row.appendChild(mkCell('project_ids', meta.project ? String(meta.project) : '', false));
+  row.appendChild(mkCell('subject_labels', meta.subject ? String(meta.subject) : '', false));
+  row.appendChild(mkCell('experiment_labels', meta.session ? String(meta.session) : '', false));
 
   const tdRemove = document.createElement('td');
   const btn = document.createElement('button');
-  btn.type = 'button'; btn.className = 'remove-btn'; btn.textContent = '❌';
+  btn.type = 'button';
+  btn.className = 'remove-btn';
+  btn.textContent = '❌';
   btn.addEventListener('click', function(){
     const key = row.dataset.seriesKey;
-    if (row.dataset.kind === 'rda'){ rdaRowByKey.delete(key); }
+    const uid = row.dataset.uid;
+
+    if (uid){
+      rowByUid.delete(uid);
+      selectedFiles.delete(uid); // local file (no-op for token-only rows)
+    }
+
+    if (row.dataset.kind === 'rda'){
+      rdaRowByKey.delete(key);
+      rdaMetaByKey.delete(key);
+    }
     if (row.dataset.kind === 'dat'){
       const arr = datRowsByKey.get(key) || [];
-      datRowsByKey.set(key, arr.filter(function(r){ return r !== row; }));
+      datRowsByKey.set(key, arr.filter(r => r !== row));
     }
+
     row.remove();
   });
   tdRemove.appendChild(btn);
   row.appendChild(tdRemove);
 
   tbody.appendChild(row);
+  if (uidVal) rowByUid.set(uidVal, row);
 
   const key = row.dataset.seriesKey;
+
   if (kind === 'rda'){
     rdaRowByKey.set(key, row);
-    ['project_ids','subject_labels','experiment_labels','scan_ids'].forEach(function(sel){
-      row.querySelector("input[name='" + sel + "']").addEventListener('input', function(){ propagateFromRda(key); });
+
+    // seed meta map from row
+    const vals = rowVals(row);
+    if (key) rdaMetaByKey.set(key, { ...vals, key });
+
+    // propagate on edits
+    ['project_ids','subject_labels','experiment_labels','scan_ids','series_descs'].forEach(function(sel){
+      const inp = row.querySelector("input[name='" + sel + "']");
+      if (inp) inp.addEventListener('input', function(){ propagateFromRda(key); });
     });
-    propagateFromRda(key);
+
+    // initial fill of any existing DATs (empty-only, not series)
+    if (key) refreshDatMatchesForKey(key, false);
   } else {
     const arr = datRowsByKey.get(key) || [];
-    arr.push(row); datRowsByKey.set(key, arr);
+    arr.push(row);
+    datRowsByKey.set(key, arr);
+
+    // if we already know an RDA for this key, fill any missing dat fields now (empty-only, not series)
+    if (key) refreshDatMatchesForKey(key, false);
   }
 }
 
-/* ===== File handling ===== */
+/* ===== File handling: additive (DO NOT CLEAR TABLE) ===== */
 async function handleFiles(fileList){
   try{
-    const files = Array.prototype.slice.call(fileList || []);
-    log('Selected files:', files.map(f => f.name));
+    const newlyPicked = Array.prototype.slice.call(fileList || []);
+    log('Newly picked:', newlyPicked.map(f => f.name));
 
-    const tbody = document.getElementById('fileTableBody');
-    if (!tbody){ err('No tbody'); return; }
-    tbody.innerHTML = '';
-    rdaRowByKey.clear(); datRowsByKey.clear();
+    // accumulate local files by uid
+    for (const f of newlyPicked){
+      selectedFiles.set(fileId(f), f);
+    }
 
     // RDAs first
-    const rdaFiles = files.filter(function(f){ return /\\.rda$/i.test(f.name); });
-    const rdaInfos = [];
-    for (var i=0; i<rdaFiles.length; i++){
-      const f = rdaFiles[i];
+    const rdaFiles = newlyPicked.filter(f => /\\.rda$/i.test(f.name));
+    for (const f of rdaFiles){
+      const uid = fileId(f);
+      if (rowByUid.has(uid)) continue;
+
       let txt = '';
       try { txt = await readFileText(f); }
       catch(ex){ warn('FileReader failed for', f.name, ex); continue; }
@@ -466,35 +548,49 @@ async function handleFiles(fileList){
         project: sanitize(hdr.StudyDescription || ''),
         subject: sanitize(hdr.PatientName || ''),
         session: sanitize(hdr.PatientID || ''),
-        key: normSeriesKey(hdr.SeriesDescription || '')
+        key: normSeriesKey(hdr.SeriesDescription || ''),
+        uid
       };
-      rdaInfos.push({ file:f, meta:meta });
+
+      addRow('rda', f.name, meta);
+
+      // seed meta map for matching later DAT rows (and fill existing dats empty-only)
+      if (meta.key){
+        rdaMetaByKey.set(meta.key, {
+          scan: meta.scan || '',
+          series: meta.series || '',   // kept but NOT propagated to DATs
+          project: meta.project || '',
+          subject: meta.subject || '',
+          session: meta.session || '',
+          key: meta.key
+        });
+        refreshDatMatchesForKey(meta.key, false);
+      }
     }
-    for (var j=0; j<rdaInfos.length; j++){ addRow('rda', rdaInfos[j].file.name, rdaInfos[j].meta); }
 
-    const rdaMetaByKey = new Map(
-      rdaInfos.filter(function(x){ return !!x.meta.key; }).map(function(x){ return [x.meta.key, x.meta]; })
-    );
+    // DATs next
+    const datFiles = newlyPicked.filter(f => /\\.dat$/i.test(f.name));
+    for (const f of datFiles){
+      const uid = fileId(f);
+      if (rowByUid.has(uid)) continue;
 
-    // DATs next (still add rows even if no matching RDA)
-    const datFiles = files.filter(function(f){ return /\\.dat$/i.test(f.name); });
-    for (var k=0; k<datFiles.length; k++){
-      const f = datFiles[k];
       const seriesRaw = parseDatSeries(f.name);
       const key = normSeriesKey(seriesRaw);
-      const rdaMeta = rdaMetaByKey.get(key) || { scan:'', series:seriesRaw, project:'', subject:'', session:'', key:key };
-      const meta = {
-        scan: rdaMeta.scan,
-        series: rdaMeta.series || seriesRaw,
-        project: rdaMeta.project,
-        subject: rdaMeta.subject,
-        session: rdaMeta.session,
-        key: key
-      };
-      addRow('dat', f.name, meta);
+      const meta = rdaMetaByKey.get(key) || { scan:'', series:'', project:'', subject:'', session:'', key };
+
+      // IMPORTANT: DAT series_descs comes from DAT filename parsing (seriesRaw), not RDA
+      addRow('dat', f.name, {
+        scan: meta.scan,
+        series: seriesRaw,
+        project: meta.project,
+        subject: meta.subject,
+        session: meta.session,
+        key,
+        uid
+      });
     }
 
-    log('Table rows now:', document.querySelectorAll('#fileTableBody tr').length);
+    log('Rows now:', document.querySelectorAll('#fileTableBody tr').length);
   } catch (e){
     err('handleFiles failed:', e);
     alert('Problem processing files. See console for details.');
@@ -535,6 +631,8 @@ window.addEventListener('DOMContentLoaded', function(){
     const tbody = document.getElementById('fileTableBody');
     tbody.innerHTML = '';
     rdaRowByKey.clear(); datRowsByKey.clear();
+    rowByUid.clear(); rdaMetaByKey.clear();
+    selectedFiles.clear(); // restored rows are server-staged; no local File objects
 
     rows.forEach(r => {
       addRow(r.kind, r.filename, {
@@ -543,9 +641,21 @@ window.addEventListener('DOMContentLoaded', function(){
         project: r.project || '',
         subject: r.subject || '',
         session: r.session || '',
-        key: r.key || '',
-        token: r.token || ''
+        key: r.key || normSeriesKey(r.series_desc || ''),
+        token: r.token || '',
+        uid: r.uid || '' // IMPORTANT: backend must persist uid in pending_rows
       });
+    });
+
+    // Reconstruct minimal RDA meta from restored rows so later DATs can match,
+    // and also so restored DATs can fill if their RDA is present.
+    document.querySelectorAll('#fileTableBody tr').forEach(row => {
+      if (row.dataset.kind !== 'rda') return;
+      const key = row.dataset.seriesKey || '';
+      if (!key) return;
+      const vals = rowVals(row);
+      rdaMetaByKey.set(key, { ...vals, key });
+      refreshDatMatchesForKey(key, false); // empty-only on restore
     });
   } catch (e) {
     console.warn("Failed to restore pending rows", e);
@@ -553,11 +663,46 @@ window.addEventListener('DOMContentLoaded', function(){
   {% endif %}
 
   fileInput.addEventListener('change', function(e){ handleFiles(e.target.files); });
+
   const prevBtn = document.getElementById('preview_xnat_btn');
   if (prevBtn) prevBtn.addEventListener('click', openXNATPreviewsFromTable);
 
   if (form){
     form.addEventListener('submit', function(){
+      // Ensure the <input type="file"> includes ONLY locally-selected, NOT-yet-staged files,
+      // and include upload_uids aligned with multipart order.
+      try {
+        // remove old upload_uids inputs
+        document.querySelectorAll("input[name='upload_uids']").forEach(n => n.remove());
+
+        const dt = new DataTransfer();
+        const rows = document.querySelectorAll('#fileTableBody tr');
+
+        rows.forEach(row => {
+          const tok = (row.querySelector("input[name='file_tokens']")||{}).value || '';
+          const uid = (row.querySelector("input[name='row_uids']")||{}).value || '';
+
+          // if already staged (token exists), don't re-upload bytes
+          if (tok && tok.trim()) return;
+
+          const f = selectedFiles.get(uid);
+          if (!f) return;
+
+          dt.items.add(f);
+
+          const u = document.createElement('input');
+          u.type = 'hidden';
+          u.name = 'upload_uids';
+          u.value = uid;
+          form.appendChild(u);
+        });
+
+        const fileInput = document.getElementById('rda_input');
+        if (fileInput) fileInput.files = dt.files;
+      } catch (e) {
+        console.warn("Could not rebuild FileList for submit:", e);
+      }
+
       if (previewWins && previewWins.length){
         previewWins.forEach(function(w){ try{ if (w && !w.closed) w.close(); }catch(_){} });
       }
@@ -1046,21 +1191,28 @@ def index():
         pending_rows=pending_rows,
     )
 
+#     return redirect(url_for("index"))
 @app.route('/upload', methods=['POST'])
 def upload():
     if "xnat_user" not in session:
         return redirect(url_for("login"))
 
+    import hashlib
+
     label = "MRS"
 
-    # ---- Table arrays (these are the authoritative state) ----
+    # ---- Table arrays (authoritative state) ----
     names = request.form.getlist('file_names')
     scans = request.form.getlist('scan_ids')
     descs = request.form.getlist('series_descs')
     projs = request.form.getlist('project_ids')
     subs  = request.form.getlist('subject_labels')
     exps  = request.form.getlist('experiment_labels')
-    toks  = request.form.getlist('file_tokens')  # hidden input per row
+    toks  = request.form.getlist('file_tokens')   # hidden input per row (may be blank)
+    row_uids = request.form.getlist('row_uids')   # hidden input per row (may be blank for old sessions)
+
+    # For the newly-uploaded multipart files only (order must match request.files.getlist("files"))
+    upload_uids = request.form.getlist('upload_uids')
 
     def _to_int_or_none(x: Optional[str]) -> Optional[int]:
         try:
@@ -1069,34 +1221,125 @@ def upload():
         except Exception:
             return None
 
-    # ------------------------------------------------------------
-    # Determine: first submit vs retry submit
-    # ------------------------------------------------------------
-    has_tokens = any(t.strip() for t in toks)
+    def _sha256_file(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
 
-    if not has_tokens:
-        # FIRST SUBMIT: stage incoming files
-        incoming = [f for f in request.files.getlist("files") if f and f.filename]
-        if not incoming:
-            flash("No files selected.")
+    if not names:
+        flash("No files selected.")
+        return redirect(url_for("index"))
+
+    # Normalize list lengths to avoid index errors
+    if len(toks) < len(names):
+        toks = toks + [""] * (len(names) - len(toks))
+    if len(row_uids) < len(names):
+        row_uids = row_uids + [""] * (len(names) - len(row_uids))
+
+    # ------------------------------------------------------------
+    # SAFETY: any row missing both token and uid is unmappable
+    # ------------------------------------------------------------
+    for i, fname in enumerate(names):
+        if (toks[i] or "").strip():
+            continue
+        if not (row_uids[i] or "").strip():
+            flash(
+                f"Upload error: row '{fname}' is missing its metadata. "
+                "Please refresh the page and re-select files."
+            )
             return redirect(url_for("index"))
 
-        pending_files: dict[str, dict] = {}
-        for fs in incoming:
-            token, path = _stage_save_filestorage(fs)
-            pending_files[token] = {"filename": fs.filename, "path": path}
-        session["pending_files"] = pending_files
+    # ------------------------------------------------------------
+    # Stage any incoming files (works for BOTH first submit and retry)
+    # Uses upload_uids to uniquely identify each incoming file, so
+    # duplicate filenames are allowed.
+    # ------------------------------------------------------------
+    incoming = [f for f in request.files.getlist("files") if f and f.filename]
 
-        # map filename -> token (assumes filenames are unique per batch)
-        fname_to_tok = {info["filename"]: tok for tok, info in pending_files.items()}
-        toks = [fname_to_tok.get(fn, "") for fn in names]
+    # upload_uids must align with incoming files list order
+    if incoming and len(upload_uids) != len(incoming):
+        flash(
+            "Upload error: missing file metadata. "
+            "Please refresh the page and try again."
+        )
+        return redirect(url_for("index"))
 
-    else:
-        # RETRY SUBMIT: must have staged files
-        if not session.get("pending_files"):
-            flash("Staged file data expired. Please re-select your files and try again.")
-            session.pop("pending_rows", None)
-            return redirect(url_for("index"))
+    pending_files: dict[str, dict] = session.get("pending_files", {}) or {}
+
+    # uid -> list of (token, info) in "most-recent-last" order
+    staged_by_uid: dict[str, list[tuple[str, dict]]] = {}
+    for tok, info in pending_files.items():
+        uid0 = (info.get("uid") or "").strip()
+        if uid0:
+            staged_by_uid.setdefault(uid0, []).append((tok, info))
+
+    # deterministically prefer the last staged entry for each uid
+    uid_to_tok: dict[str, str] = {}
+    for uid0, items in staged_by_uid.items():
+        uid_to_tok[uid0] = items[-1][0]
+
+    # Stage each incoming file; allow same filename as long as contents differ.
+    # If the same uid arrives again:
+    #   - if hash matches an already staged file under that uid, reuse its token
+    #   - else stage a new entry (rare, but possible)
+    for fs, uid in zip(incoming, upload_uids):
+        uid = (uid or "").strip()
+        if not uid:
+            continue
+
+        token, path = _stage_save_filestorage(fs)
+
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            size = None
+
+        try:
+            file_hash = _sha256_file(path)
+        except Exception:
+            file_hash = None
+
+        # Check for identical content already staged under this uid
+        reused_tok: Optional[str] = None
+        if uid in staged_by_uid and file_hash:
+            for existing_tok, existing_info in staged_by_uid[uid]:
+                if existing_info.get("sha256") == file_hash:
+                    reused_tok = existing_tok
+                    break
+
+        if reused_tok:
+            # identical content already staged -> discard new file, set mapping, don't add entry
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            uid_to_tok[uid] = reused_tok
+            continue
+
+        # Otherwise record a new staged file (even if filename duplicates)
+        pending_files[token] = {
+            "filename": fs.filename,
+            "path": path,
+            "uid": uid,
+            "size": size,
+            "sha256": file_hash,
+        }
+        staged_by_uid.setdefault(uid, []).append((token, pending_files[token]))
+        uid_to_tok[uid] = token  # newest wins, deterministically
+
+    session["pending_files"] = pending_files
+
+    # ------------------------------------------------------------
+    # Fill missing row tokens by UID (NOT filename)
+    # ------------------------------------------------------------
+    for i in range(len(names)):
+        if (toks[i] or "").strip():
+            continue
+        uid = (row_uids[i] or "").strip()
+        if uid and uid in uid_to_tok:
+            toks[i] = uid_to_tok[uid]
 
     # ------------------------------------------------------------
     # Build row items from table (persisted on failure)
@@ -1105,6 +1348,7 @@ def upload():
     for i, fname in enumerate(names):
         row_items.append({
             "token": (toks[i].strip() if i < len(toks) else ""),
+            "uid": (row_uids[i].strip() if i < len(row_uids) else ""),
             "filename": fname,
             "kind": "dat" if fname.lower().endswith(".dat") else "rda",
             "scan_id": _to_int_or_none(scans[i]) if i < len(scans) else None,
@@ -1132,7 +1376,6 @@ def upload():
             with _staged_open(tok) as fh:
                 blob = fh.read()
         except UserFacingError:
-            # leave it to upload stage to error out nicely
             continue
 
         hdr = _parse_hdr(blob)
@@ -1140,6 +1383,7 @@ def upload():
 
         rda_meta.append({
             "token": tok,
+            "uid": row.get("uid", ""),
             "filename": row["filename"],
             "project": row["project"] or p,
             "subject": row["subject"] or s,
@@ -1179,7 +1423,10 @@ def upload():
         name = row["filename"]
 
         if not tok:
-            bad.append(f"{name}: Missing staged file token. Please re-select files and try again.")
+            bad.append(
+                f"{name}: Missing staged file token. "
+                "If you just added this file, please re-select it and try again."
+            )
             failed_rows.append(row)
             continue
 
@@ -1193,18 +1440,26 @@ def upload():
             continue
 
         # Determine metadata for this row
+        meta = None
+        has_rda_match = False
+
         if row["kind"] == "rda":
-            meta = next((r for r in rda_meta if r["filename"] == name), None)
+            meta = next((r for r in rda_meta if r["token"] == tok), None)
             if not meta:
                 bad.append(f"{name}: Could not parse RDA metadata.")
                 failed_rows.append(row)
                 continue
+            has_rda_match = True
         else:
             meta = best_match(name, rda_meta)
-            if not meta:
-                bad.append(f"{name}: No matching RDA found (cannot infer metadata).")
-                failed_rows.append(row)
-                continue
+            if meta:
+                has_rda_match = True
+            else:
+                # No RDA match. That's OK *if the table provides required identifiers*.
+                # We'll proceed using table overrides only.
+                has_rda_match = False
+                meta = {}  # keep downstream code simple
+
 
         # Apply table overrides (already sanitized)
         p = row["project"] or meta.get("project") or ""
@@ -1212,6 +1467,10 @@ def upload():
         e = row["session"] or meta.get("session") or ""
         sc = row["scan_id"] if row["scan_id"] is not None else meta.get("scan_id")
         d = meta.get("study_date")
+        # If DAT has no RDA match, we can't validate StudyDate against RDA
+        if row["kind"] == "dat" and not has_rda_match:
+            d = None
+
 
         if not (p and s and e and sc is not None):
             bad.append(f"{name}: Missing required Project/Subject/Session/Scan in the table.")
@@ -1235,10 +1494,11 @@ def upload():
             failed_rows.append(row)
             continue
 
-        if study_dt != (d or study_dt):
+        if d is not None and study_dt != d:
             bad.append(f"{name}: StudyDate mismatch: DICOM={study_dt}, RDA={d}")
             failed_rows.append(row)
             continue
+
 
         # Upload
         base = f"{XNAT_BASE_URL}/data/projects/{p}/subjects/{s}/experiments/{e}/scans/{sc}"
@@ -1270,7 +1530,7 @@ def upload():
     # If nothing failed, clear pending state entirely
     if not failed_rows:
         session.pop("pending_rows", None)
-        if not session.get("pending_files"):
+        if session.get("pending_files"):
             session.pop("pending_files", None)
 
     # Summary banner
@@ -1293,6 +1553,7 @@ def upload():
         ]
 
     return redirect(url_for("index"))
+
 
 
 
