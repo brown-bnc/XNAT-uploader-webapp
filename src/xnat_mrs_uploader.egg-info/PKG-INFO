@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: xnat-mrs-uploader
+Version: 0.1.0
+Summary: Local Flask app for uploading Siemens MRS (.rda/.dat) resources to XNAT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: Flask>=2.2
+
+# XNAT-uploader-webapp
+
+python -m pip install --user pipx
+python -m pipx ensurepath
+pipx install git+https://github.com/<org>/<repo>.git

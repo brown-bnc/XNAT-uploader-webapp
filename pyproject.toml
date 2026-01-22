@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xnat-mrs-uploader"
+version = "0.1.0"
+description = "Local Flask app for uploading Siemens MRS (.rda/.dat) resources to XNAT"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["Flask>=2.2"]
+
+[project.scripts]
+xnat-mrs-uploader = "xnat_mrs_uploader.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
