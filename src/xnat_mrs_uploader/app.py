@@ -1,4 +1,4 @@
-#XNAT_MRS_webapp.py — Flask web‑app for bulk uploading .rda & .dat spectroscopy resources to XNAT
+#app.py — Flask web‑app for bulk uploading .rda & .dat spectroscopy resources to XNAT
 # ====================================================================
 """
 Quick start
@@ -6,7 +6,7 @@ Quick start
 ```bash
 python -m pip install Flask          # if not installed
 export XNAT_BASE_URL=https://xnat.bnc.brown.edu  # or any XNAT
-python XNATwebapp_twix.py
+python XNAT_MRS_webapp.py
 # → open http://127.0.0.1:5000, log in, upload files
 ```
 """
@@ -33,6 +33,8 @@ from pathlib import Path
 import secrets
 import shutil
 from http.cookies import SimpleCookie
+import threading
+import webbrowser
 
 # ---------------------------------------------------------------------------
 # Graceful Flask import
@@ -57,8 +59,34 @@ except ModuleNotFoundError:
 # Config
 # ---------------------------------------------------------------------------
 XNAT_BASE_URL: str = os.getenv("XNAT_BASE_URL", "https://xnat.bnc.brown.edu").rstrip("/")
-app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-me-pls")
+app = Flask(__name__, instance_relative_config=True)
+
+def load_or_create_secret() -> str:
+    env = os.getenv("FLASK_SECRET_KEY")
+    if env and env.strip():
+        return env.strip()
+
+    secret_path = Path(app.instance_path) / "secret_key"
+    secret_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if secret_path.exists():
+        return secret_path.read_text().strip()
+
+    new = secrets.token_urlsafe(64)
+    secret_path.write_text(new)
+    try:
+        os.chmod(secret_path, 0o600)
+    except Exception:
+        pass
+    return new
+
+app.secret_key = load_or_create_secret()
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=False,  # local HTTP
+)
 app.permanent_session_lifetime = timedelta(minutes=5)
 
 # defaults chosen for large files over VPN/Wi-Fi
@@ -1560,16 +1588,68 @@ def upload():
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--test', action='store_true')
-    ap.add_argument('--host', default='127.0.0.1')
-    ap.add_argument('--port', type=int, default=5000)
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="xnat-mrs-uploader",
+        description="Local Flask app for bulk uploading Siemens MRS (.rda/.dat) resources to XNAT",
+    )
+    ap.add_argument("--test", action="store_true", help="Run unit tests and exit")
+    ap.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1 for local-only)")
+    ap.add_argument("--port", type=int, default=5000, help="Port to listen on (default: 5000)")
+    ap.add_argument("--debug", action="store_true", help="Enable Flask debug mode (default: off)")
+    ap.add_argument(
+        "--base-url",
+        default=None,
+        help="XNAT base URL (overrides XNAT_BASE_URL env var), e.g. https://xnat.bnc.brown.edu",
+    )
+    ap.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not auto-open the web browser on startup",
+    )
     args = ap.parse_args()
+
     if args.test:
         unittest.main(argv=[sys.argv[0]])
+        return
+
+    # Warn if binding to all interfaces
+    if args.host in ("0.0.0.0", "::"):
+        print(
+            "WARNING: You are binding to all interfaces. Anyone who can reach this machine "
+            "may be able to access the uploader. For local-only use, keep --host 127.0.0.1."
+        )
+
+    # Allow CLI override of XNAT_BASE_URL. Fall back to env var, then to the module default.
+    global XNAT_BASE_URL
+    if args.base_url and args.base_url.strip():
+        XNAT_BASE_URL = args.base_url.strip().rstrip("/")
     else:
-        app.run(host=args.host, port=args.port, debug=True)
+        XNAT_BASE_URL = os.getenv("XNAT_BASE_URL", XNAT_BASE_URL).rstrip("/")
+
+    # Local HTTP defaults (safe for local runs; for HTTPS deployments you'd change these)
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=False,
+    )
+
+    url = f"http://{args.host}:{args.port}/"
+    use_reloader = args.debug
+
+    def maybe_open_browser() -> None:
+        if args.no_browser:
+            return
+        if args.host not in ("127.0.0.1", "localhost"):
+            return
+
+        # If debug reloader is on, only open in the reloader child process.
+        # If reloader is off, open in the single process.
+        if (not use_reloader) or (os.environ.get("WERKZEUG_RUN_MAIN") == "true"):
+            threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    maybe_open_browser()
+    app.run(host=args.host, port=args.port, debug=args.debug, use_reloader=use_reloader)
 
 if __name__ == '__main__':
     main()
