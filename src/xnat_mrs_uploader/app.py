@@ -1,15 +1,6 @@
 #app.py — Flask web‑app for bulk uploading .rda & .dat spectroscopy resources to XNAT
 # ====================================================================
-"""
-Quick start
-~~~~~~~~~~
-```bash
-python -m pip install Flask          # if not installed
-export XNAT_BASE_URL=https://xnat.bnc.brown.edu  # or any XNAT
-python XNAT_MRS_webapp.py
-# → open http://127.0.0.1:5000, log in, upload files
-```
-"""
+
 from __future__ import annotations
 
 import argparse
@@ -35,6 +26,9 @@ import shutil
 from http.cookies import SimpleCookie
 import threading
 import webbrowser
+import requests
+import ipaddress
+
 
 # ---------------------------------------------------------------------------
 # Graceful Flask import
@@ -49,7 +43,7 @@ try:
         session,
         url_for,
         Response,
-        abort,
+        make_response
     )
 except ModuleNotFoundError:
     print("ERROR: Flask not installed →  python -m pip install Flask")
@@ -61,24 +55,115 @@ except ModuleNotFoundError:
 XNAT_BASE_URL: str = os.getenv("XNAT_BASE_URL", "https://xnat.bnc.brown.edu").rstrip("/")
 app = Flask(__name__, instance_relative_config=True)
 
+
+# ---------------------------------------------------------------------------
+# Idle shutdown (auto-stop server when unused)
+# ---------------------------------------------------------------------------
+_last_activity = time.time()
+
+def _touch_activity() -> None:
+    global _last_activity
+    _last_activity = time.time()
+
+@app.before_request
+def _idle_touch_before_request():
+    # Don't count internal endpoints; optionally ignore static assets too.
+    if request.path in ("/__healthz", "/__shutdown"):
+        return
+    _touch_activity()
+
+@app.get("/__healthz")
+def __healthz():
+    return "ok"
+
+SHUTDOWN_TOKEN = secrets.token_urlsafe(16)
+
+def _is_loopback(addr: str | None) -> bool:
+    if not addr:
+        return False
+    if addr.startswith("::ffff:"):
+        addr = addr.split("::ffff:", 1)[1]
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return False
+    
+@app.post("/__shutdown")
+def __shutdown():
+    # 1) only accept loopback (but don't 403 loudly)
+    if not _is_loopback(request.remote_addr):
+        return ("", 204)
+
+    # 2) token gate so old tabs can't affect a new run
+    tok = request.args.get("t") or request.headers.get("X-Shutdown-Token")
+    if tok != SHUTDOWN_TOKEN:
+        # IMPORTANT: don't 403; just ignore so Chrome doesn't show an error page
+        return ("", 204)
+
+    # cleanup (best-effort)
+    try:
+        _clear_all_staged_for_session()
+    except Exception:
+        pass
+    try:
+        _cleanup_orphaned_staged_files(max_age_hours=0)
+    except Exception:
+        pass
+
+    func = request.environ.get("werkzeug.server.shutdown")
+    if func is not None:
+        func()
+        return "shutting down (werkzeug)"
+
+    def _exit_soon():
+        time.sleep(0.2)
+        os._exit(0)
+
+    threading.Thread(target=_exit_soon, daemon=True).start()
+    return "shutting down (forced)"
+
+@app.post("/__quit")
+def __quit():
+    # Only accept loopback
+    if not _is_loopback(request.remote_addr):
+        return ("", 204)
+
+    # Token gate (ignore old tabs)
+    tok = request.args.get("t") or request.headers.get("X-Shutdown-Token")
+    if tok != SHUTDOWN_TOKEN:
+        return ("", 204)
+
+    # Best-effort cleanup
+    try:
+        _clear_all_staged_for_session()
+    except Exception:
+        pass
+
+    session.clear()
+
+    resp = make_response("quitting")
+    # Flask 3+: app.session_cookie_name is gone; use config key
+    resp.delete_cookie(app.config.get("SESSION_COOKIE_NAME", "session"))
+
+    # Shut down AFTER the response gets out
+    func = request.environ.get("werkzeug.server.shutdown")
+    if func is not None:
+        threading.Thread(target=lambda: (time.sleep(0.2), func()), daemon=True).start()
+        return resp
+
+    # Fallback: hard-exit process
+    threading.Thread(target=lambda: (time.sleep(0.2), os._exit(0)), daemon=True).start()
+    return resp
+
+
+    
 def load_or_create_secret() -> str:
     env = os.getenv("FLASK_SECRET_KEY")
     if env and env.strip():
         return env.strip()
 
-    secret_path = Path(app.instance_path) / "secret_key"
-    secret_path.parent.mkdir(parents=True, exist_ok=True)
+    return secrets.token_urlsafe(64)
 
-    if secret_path.exists():
-        return secret_path.read_text().strip()
-
-    new = secrets.token_urlsafe(64)
-    secret_path.write_text(new)
-    try:
-        os.chmod(secret_path, 0o600)
-    except Exception:
-        pass
-    return new
 
 app.secret_key = load_or_create_secret()
 
@@ -276,7 +361,10 @@ UPLOAD_HTML = """
     <div class="card">
       <div class="card-header">
         <h2>Raw Spectroscopy Data XNAT Uploader</h2>
-        <div class="toolbar"><a href="{{ url_for('logout') }}">Logout</a></div>
+        <div class="toolbar">
+  <button type="button" id="quitBtn" class="btn btn-ghost">Quit</button>
+</div>
+
       </div>
 
       {% with messages=get_flashed_messages() %}
@@ -746,6 +834,34 @@ window.addEventListener('DOMContentLoaded', function(){
     }
   } catch (e) { warn('XNAT reload failed:', e); }
   {% endif %}
+
+
+const shutdownToken = {{ shutdown_token | tojson }};
+
+function requestShutdown() {
+  try { navigator.sendBeacon(`/__quit?t=${encodeURIComponent(shutdownToken)}`); } catch(_) {}
+  try {
+    fetch(`/__quit?t=${encodeURIComponent(shutdownToken)}`, {
+      method: "POST", cache: "no-store", credentials: "same-origin", keepalive: true
+    }).catch(()=>{});
+  } catch(_) {}
+}
+
+
+const quitBtn = document.getElementById("quitBtn");
+if (quitBtn) {
+  quitBtn.addEventListener("click", () => {
+    quitBtn.disabled = true;
+    quitBtn.textContent = "Quitting…";
+    requestShutdown();
+
+    document.body.innerHTML = `
+      <div style="font-family:system-ui;padding:2rem">
+        <h2>Uploader stopping…</h2>
+      </div>`;
+  });
+}
+
 });
 </script>
 </body>
@@ -843,8 +959,6 @@ def _init_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.addHandler(handler)
-
-
 
 def _stage_dir() -> Path:
     d = Path.home() / ".xnat_uploader" / "staged"
@@ -1204,6 +1318,73 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
+@app.after_request
+def _no_cache(resp):
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
+LAUNCH_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Launching XNAT Uploader…</title>
+</head>
+<body style="font-family:system-ui;padding:1.5rem">
+  <h3>Launching XNAT Uploader…</h3>
+  <p>If a popup blocker prevents the uploader window from opening, allow popups for this site and refresh.</p>
+
+  <script>
+    const shutdownToken = {{ shutdown_token | tojson }};
+
+    // Open the real UI as a JS-opened window (closable later).
+    // NOTE: must happen synchronously to avoid popup blockers.
+    const child = window.open("/", "xnat_uploader", "popup=yes");
+
+    // If popup blocked, give the user a clickable fallback.
+    if (!child) {
+      document.body.insertAdjacentHTML("beforeend", `
+        <p><b>Popup was blocked.</b></p>
+        <p><a href="/" target="_blank" rel="noopener">Open the uploader</a></p>
+      `);
+    }
+
+    async function loop() {
+      try {
+        // Health check: no-store avoids cached "ok"
+        const r = await fetch("/__healthz", { cache: "no-store" });
+        if (!r.ok) throw new Error("health not ok");
+      } catch (e) {
+        // Server is gone -> close child window if we can
+        try { if (child && !child.closed) child.close(); } catch (_) {}
+
+        // Try to close launcher too (works if this tab was opened by code)
+        try { window.close(); } catch (_) {}
+
+        // If close was blocked, show a clear "stopped" page
+        document.body.innerHTML = `
+          <div style="font-family:system-ui;padding:2rem">
+            <h2>Uploader stopped</h2>
+            <p>The local server is no longer running.</p>
+            <p>You can close this tab.</p>
+          </div>`;
+        return;
+      }
+
+      setTimeout(loop, 1200);
+    }
+
+    loop();
+  </script>
+</body>
+</html>
+"""
+@app.get("/launch")
+def launch():
+    html = render_template_string(LAUNCH_HTML, shutdown_token=SHUTDOWN_TOKEN)
+    return Response(html, headers={"Cache-Control": "no-store"})
 
 
 @app.route('/')
@@ -1217,9 +1398,10 @@ def index():
         XNAT_BASE_URL=XNAT_BASE_URL,
         reload_urls=reload_urls,
         pending_rows=pending_rows,
+        shutdown_token=SHUTDOWN_TOKEN,
     )
 
-#     return redirect(url_for("index"))
+
 @app.route('/upload', methods=['POST'])
 def upload():
     if "xnat_user" not in session:
@@ -1583,6 +1765,50 @@ def upload():
     return redirect(url_for("index"))
 
 
+def start_idle_shutdown_watchdog(host: str, port: int, idle_seconds: int) -> None:
+    """
+    Shut down the Flask dev server after `idle_seconds` with no requests.
+    Uses localhost POST to /__shutdown so Werkzeug shutdown runs in request context.
+    """
+    if idle_seconds <= 0:
+        return
+
+    # Only works for local binds; if you bind 0.0.0.0 we still *try*,
+    # but it’s best to keep local-only for safety.
+    req_host = host
+    if host in ("0.0.0.0", "::"):
+        req_host = "127.0.0.1"
+
+    health = f"http://{req_host}:{port}/__healthz"
+    shutdown = f"http://{req_host}:{port}/__shutdown?t={SHUTDOWN_TOKEN}"
+
+    def _watch():
+        # Wait until server is reachable
+        while True:
+            try:
+                requests.get(health, timeout=0.5)
+                break
+            except Exception:
+                time.sleep(0.2)
+
+        # Monitor idle time
+        while True:
+            time.sleep(2)
+            if time.time() - _last_activity > idle_seconds:
+                # _touch_activity()
+                try:
+                    print("trying to shut down server due to inactivity...")
+                    r = requests.post(shutdown, timeout=1.0)
+                    print("shutdown response:", r.status_code, r.text[:200])
+
+                except Exception:
+                    print('failed to shut down the server')
+                    pass
+                return
+
+    threading.Thread(target=_watch, daemon=True).start()
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1595,7 +1821,7 @@ def main() -> None:
     )
     ap.add_argument("--test", action="store_true", help="Run unit tests and exit")
     ap.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1 for local-only)")
-    ap.add_argument("--port", type=int, default=5000, help="Port to listen on (default: 5000)")
+    ap.add_argument("--port", type=int, default=5055, help="Port to listen on (default: 5055)")
     ap.add_argument("--debug", action="store_true", help="Enable Flask debug mode (default: off)")
     ap.add_argument(
         "--base-url",
@@ -1607,6 +1833,13 @@ def main() -> None:
         action="store_true",
         help="Do not auto-open the web browser on startup",
     )
+    ap.add_argument(
+        "--idle-shutdown-seconds",
+        type=int,
+        default=600,
+        help="Auto-stop server after N seconds of inactivity (default: 600). Set 0 to disable.",
+    )
+
     args = ap.parse_args()
 
     if args.test:
@@ -1633,9 +1866,12 @@ def main() -> None:
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=False,
     )
+    url = f"http://{args.host}:{args.port}/launch"
 
-    url = f"http://{args.host}:{args.port}/"
-    use_reloader = args.debug
+    use_reloader = False
+
+    if args.idle_shutdown_seconds > 0:
+        start_idle_shutdown_watchdog(args.host, args.port, args.idle_shutdown_seconds)
 
     def maybe_open_browser() -> None:
         if args.no_browser:
