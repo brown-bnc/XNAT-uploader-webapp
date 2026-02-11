@@ -19,7 +19,7 @@ python3 -m venv .xnat_uploader_venv
 source .xnat_uploader_venv/bin/activate
 python -m pip install --upgrade pip
 
-pip install https://github.com/brown-bnc/XNAT-uploader-webapp/archive/refs/tags/v0.1.0.zip
+pip install https://github.com/brown-bnc/XNAT-uploader-webapp/archive/refs/tags/v0.1.1.zip
 
 xnat-mrs-uploader
 ```
@@ -31,7 +31,7 @@ py -m venv .xnat_uploader_venv
 .\.xnat_uploader_venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 
-pip install https://github.com/brown-bnc/XNAT-uploader-webapp/archive/refs/tags/v0.1.0.zip
+pip install https://github.com/brown-bnc/XNAT-uploader-webapp/archive/refs/tags/v0.1.1.zip
 
 xnat-mrs-uploader
 ```
