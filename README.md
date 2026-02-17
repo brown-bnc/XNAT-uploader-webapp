@@ -15,11 +15,11 @@ Repo: [https://github.com/brown-bnc/XNAT-uploader-webapp](https://github.com/bro
 ### macOS / Linux
 
 ```bash
-python3 -m venv .xnat_uploader_venv
-source .xnat_uploader_venv/bin/activate
+python3 -m venv xnat_uploader_venv
+source xnat_uploader_venv/bin/activate
 python -m pip install --upgrade pip
 
-pip install https://github.com/brown-bnc/XNAT-uploader-webapp/archive/refs/tags/v0.1.1.zip
+pip install https://github.com/brown-bnc/XNAT-uploader-webapp/archive/refs/tags/v0.1.2.zip
 
 xnat-mrs-uploader
 ```
@@ -27,11 +27,11 @@ xnat-mrs-uploader
 ### Windows (PowerShell)
 
 ```powershell
-py -m venv .xnat_uploader_venv
-.\.xnat_uploader_venv\Scripts\Activate.ps1
+py -m venv xnat_uploader_venv
+.\xnat_uploader_venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 
-pip install https://github.com/brown-bnc/XNAT-uploader-webapp/archive/refs/tags/v0.1.1.zip
+pip install https://github.com/brown-bnc/XNAT-uploader-webapp/archive/refs/tags/v0.1.2.zip
 
 xnat-mrs-uploader
 ```
