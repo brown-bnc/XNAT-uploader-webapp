@@ -200,6 +200,7 @@ LOGIN_HTML = """
   }
 
   .login-container {
+    position: relative;
     background: white;
     padding: 2.5rem 3rem;
     border-radius: 8px;
@@ -207,6 +208,26 @@ LOGIN_HTML = """
     width: 100%;
     max-width: 400px;
   }
+
+  .toolbar {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+  }
+
+  .btn-ghost {
+    appearance: none;
+    border: 1px solid #dfe8ff;
+    background: #eef3ff;
+    color: #4285f4;
+    border-radius: 6px;
+    padding: .45rem .7rem;
+    font-weight: 700;
+    cursor: pointer;
+    font-size: .9rem;
+  }
+  .btn-ghost:hover { background:#e3ecff; border-color:#d2e0ff; }
+  .btn-ghost:disabled { opacity: .6; cursor: default; }
 
   h2 {
     text-align: center;
@@ -236,7 +257,7 @@ LOGIN_HTML = """
     box-shadow: 0 0 0 2px rgba(66,133,244,0.2);
   }
 
-  button {
+  button.login {
     width: 100%;
     margin-top: 1.2rem;
     padding: 0.7rem;
@@ -249,9 +270,7 @@ LOGIN_HTML = """
     font-weight: 600;
   }
 
-  button:hover {
-    background: #357ae8;
-  }
+  button.login:hover { background: #357ae8; }
 
   .flash {
     background: #fdecea;
@@ -273,6 +292,11 @@ LOGIN_HTML = """
 </head>
 <body>
   <div class="login-container">
+
+    <div class="toolbar">
+      <button type="button" id="quitBtn" class="btn-ghost">Quit</button>
+    </div>
+
     <h2>XNAT Login</h2>
 
     {% with m=get_flashed_messages() %}
@@ -290,14 +314,41 @@ LOGIN_HTML = """
       <label for="password">Password</label>
       <input id="password" name="password" type="password" required>
 
-      <button type="submit">Log In</button>
+      <button class="login" type="submit">Log In</button>
     </form>
 
     <footer>Brown University • Behavior & Neurodata Core</footer>
   </div>
+
+<script>
+  const shutdownToken = {{ shutdown_token | tojson }};
+
+  function requestShutdown() {
+    try { navigator.sendBeacon(`/__quit?t=${encodeURIComponent(shutdownToken)}`); } catch(_) {}
+    try {
+      fetch(`/__quit?t=${encodeURIComponent(shutdownToken)}`, {
+        method: "POST", cache: "no-store", credentials: "same-origin", keepalive: true
+      }).catch(()=>{});
+    } catch(_) {}
+  }
+
+  const quitBtn = document.getElementById("quitBtn");
+  if (quitBtn) {
+    quitBtn.addEventListener("click", () => {
+      quitBtn.disabled = true;
+      quitBtn.textContent = "Quitting…";
+      requestShutdown();
+      document.body.innerHTML = `
+        <div style="font-family:system-ui;padding:2rem">
+          <h2>Uploader stopping…</h2>
+        </div>`;
+    });
+  }
+</script>
 </body>
 </html>
 """
+
 
 UPLOAD_HTML = """
 <!doctype html>
@@ -1300,15 +1351,15 @@ def login():
             js = _xnat_login_jsession(user, pwd, timeout=15)
         except UserFacingError as err:
             flash(str(err))
-            return render_template_string(LOGIN_HTML)
+            return render_template_string(LOGIN_HTML, shutdown_token=SHUTDOWN_TOKEN)
 
         session.permanent = True
-        session['xnat_user'] = user          # optional (nice for auditing/logging)
-        session['xnat_jsession'] = js        # ✅ store only this
-        session.pop('xnat_pass', None)       # ✅ ensure no password sticks around
+        session['xnat_user'] = user
+        session['xnat_jsession'] = js
+        session.pop('xnat_pass', None)
         return redirect(url_for('index'))
 
-    return render_template_string(LOGIN_HTML)
+    return render_template_string(LOGIN_HTML, shutdown_token=SHUTDOWN_TOKEN)
 
 
 
