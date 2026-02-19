@@ -349,7 +349,6 @@ LOGIN_HTML = """
 </html>
 """
 
-
 UPLOAD_HTML = """
 <!doctype html>
 <html lang="en">
@@ -413,9 +412,8 @@ UPLOAD_HTML = """
       <div class="card-header">
         <h2>Raw Spectroscopy Data XNAT Uploader</h2>
         <div class="toolbar">
-  <button type="button" id="quitBtn" class="btn btn-ghost">Quit</button>
-</div>
-
+          <button type="button" id="quitBtn" class="btn btn-ghost">Quit</button>
+        </div>
       </div>
 
       {% with messages=get_flashed_messages() %}
@@ -427,9 +425,12 @@ UPLOAD_HTML = """
         <input id="rda_input" name="files" type="file" accept=".rda,.dat" multiple>
 
         <div class="subtle" style="margin-top:.35rem;">
-          TIP: RDA file headers are used to automatically determine Project, Subject, Session, & Scan. TWIX (.dat) files inherit this information
-          from their matching RDA file. If you manually edit any information for an RDA file, the edits will also apply to the matching .dat file, unless you separately change that row.
+          TIP: RDA file headers are used to automatically determine Project, Subject, Session, & Scan.
+          TWIX (.dat) files inherit this information only when matching is unambiguous.
+          If there are multiple DATs with the same series description, we will use StudyDate (from SeriesLOID) to match each DAT to the correct RDA when possible.
         </div>
+
+        <div id="matchWarnings" class="flash" style="display:none; border-color:#f5c2c0; background:#fdecea; color:#b12a2a;"></div>
 
         <div class="table-wrap">
           <table class="file-table">
@@ -450,7 +451,7 @@ UPLOAD_HTML = """
         </div>
 
         <div class="actions">
-          <button type="button" id="preview_xnat_btn" class="btn btn-ghost">👁 Preview XNAT Session(s)</button>
+          <button type="button" id="preview_xnat_btn" class="btn btn-ghost">Preview XNAT Session(s)</button>
           <button type="submit" class="btn btn-primary">Upload</button>
         </div>
       </form>
@@ -458,6 +459,7 @@ UPLOAD_HTML = """
   </div>
 
   <div id="spinner-overlay"><div class="spinner"></div>Uploading…</div>
+
 <script>
 /* ===== Debug helpers: surface any runtime error ===== */
 window.addEventListener('error', e => console.error('JS Error:', e.message, e.error));
@@ -465,27 +467,64 @@ function log(){ try{ console.log.apply(console, arguments); }catch(_){} }
 function warn(){ try{ console.warn.apply(console, arguments); }catch(_){} }
 function err(){ try{ console.error.apply(console, arguments); }catch(_){} }
 
-/* ===== State maps ===== */
+/* ===== State ===== */
 let previewWins = [];
-const rdaRowByKey = new Map();      // key -> rda <tr>
-const datRowsByKey = new Map();     // key -> [dat <tr>, ...]
-const rowByUid = new Map();         // uid -> <tr> (allows duplicate filenames)
-const rdaMetaByKey = new Map();     // key -> {scan,project,subject,session,series,key}  (series kept for RDA row only)
+const rowByUid = new Map();            // uid -> <tr>
+const selectedFiles = new Map();       // uid -> File
 
-/* ===== Accumulated local file selection (across multiple chooser actions) ===== */
-const selectedFiles = new Map();    // uid -> File
-
-function fileId(f){
-  return `${f.name}|||${f.size}|||${f.lastModified}`;
+// Dirty tracking that survives row removal/re-add because it is NOT stored on DOM nodes.
+const dirtyByUid = new Map();          // uid -> Set(fieldName)
+function markDirty(uid, fieldName){
+  if (!uid) return;
+  let s = dirtyByUid.get(uid);
+  if (!s){ s = new Set(); dirtyByUid.set(uid, s); }
+  s.add(fieldName);
 }
+function isDirty(uid, fieldName){
+  const s = uid ? dirtyByUid.get(uid) : null;
+  return !!(s && s.has(fieldName));
+}
+function clearDirtyForUid(uid){
+  if (!uid) return;
+  dirtyByUid.delete(uid);
+}
+
+// Matching structures
+const rdaMetasByKey = new Map();       // key -> [{uid, scan, project, subject, session, series, studyDate}, ...]
+const datRowsByKey  = new Map();       // key -> [dat <tr>, ...]
+const rdaRowsByKey  = new Map();       // key -> [rda <tr>, ...]
+
+// For printing full series description in warnings
+const seriesLabelByKey = new Map();    // key -> human-readable series description
+
+function fileId(f){ return `${f.name}|||${f.size}|||${f.lastModified}`; }
 
 /* ===== Utils ===== */
 function sanitize(txt){ return String(txt||'').trim().replace(/\\W+/g,'_').replace(/^_|_$/g,''); }
-function normSeriesKey(txt){ return String(txt||'').toLowerCase().replace(/[_-]/g,''); }
+function normSeriesKey(txt){
+  return String(txt||'')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ''); // remove spaces, underscores, punctuation, etc.
+}
+function normDate8(x){
+  const s = String(x || "").replace(/\\D+/g, "");
+  return s.length >= 8 ? s.slice(0,8) : s;
+}
+
+// meas_MID00446_FID07106_mrs_mrsref_acq_PRESS_voi_Lacc.dat
+function parseDatParts(name){
+  const s = String(name||'');
+  const m = s.match(/^meas_(MID\\d+)_?(FID\\d+)_([\\s\\S]+)\\.dat$/i);
+  if (!m) return { mid:"", fid:"", series:"" };
+  return { mid: m[1] || "", fid: m[2] || "", series: m[3] || "" };
+}
+
+// legacy fallback
 function parseDatSeries(name){
   const m = String(name||'').match(/^meas_[^_]+_[^_]+_(.+)\\.dat$/i);
   return m ? m[1] : '';
 }
+
 function readFileText(file){
   return new Promise((resolve,reject)=>{
     const r = new FileReader();
@@ -494,6 +533,7 @@ function readFileText(file){
     try { r.readAsText(file, 'ISO-8859-1'); } catch (_) { r.readAsText(file); }
   });
 }
+
 function parseRDA(text){
   try{
     const start='>>> Begin of header <<<', end='>>> End of header <<<';
@@ -513,6 +553,56 @@ function parseRDA(text){
   }catch(e){ err('parseRDA failed:', e); return {}; }
 }
 
+/* ===== DAT StudyDate best-effort (SeriesLOID) ===== */
+function datStudyDateFromSeriesLoidText(txt){
+  if (!txt) return "";
+  const i = txt.indexOf('SeriesLOID');
+  if (i < 0) return "";
+
+  // Scan a window after the keyword
+  const windowTxt = txt.slice(i, i + 1200);
+
+  // Match common Siemens patterns, e.g.:
+  // <ParamString."SeriesLOID">{ "1.3....20251014121459...." }
+  // or SeriesLOID "1.3....20251014121459...."
+  let loid = "";
+
+  let m = windowTxt.match(/SeriesLOID[\\s\\S]{0,400}?\\{\\s*"([^"]{10,240})"\\s*\\}/);
+  if (m) loid = m[1];
+
+  if (!loid){
+    m = windowTxt.match(/SeriesLOID[\\s\\S]{0,400}?"([^"]{10,240})"/);
+    if (m) loid = m[1];
+  }
+
+  if (!loid) return "";
+
+  const d14 = loid.match(/(20\\d{12})/); // YYYYMMDDHHMMSS
+  if (!d14) return "";
+
+  return d14[1].slice(0, 8); // YYYYMMDD
+}
+
+function readFileLatin1(file){
+  return new Promise((resolve,reject)=>{
+    const r = new FileReader();
+    r.onload = e => {
+      try {
+        const buf = e.target.result;
+        const bytes = new Uint8Array(buf);
+        let s = "";
+        const chunk = 0x8000;
+        for (let i=0;i<bytes.length;i+=chunk){
+          s += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
+        }
+        resolve(s);
+      } catch(err){ reject(err); }
+    };
+    r.onerror = reject;
+    r.readAsArrayBuffer(file);
+  });
+}
+
 /* ===== Table helpers ===== */
 function rowVals(row){
   return {
@@ -524,64 +614,175 @@ function rowVals(row){
   };
 }
 
-// Initial fill: only fill if empty AND not dirty
 function setIfEmptyAndNotDirty(row, fieldName, value){
   const inp = row.querySelector(`input[name='${fieldName}']`);
   if (!inp) return;
-  if (inp.dataset.dirty === "1") return;
-  if ((inp.value || '').trim()) return;  // only fill empty
+
+  const uid = row.dataset.uid || "";
+  if (isDirty(uid, fieldName)) return;
+  if ((inp.value || '').trim()) return;
+
   const v = (value || '').toString();
   inp.value = v;
   inp.title = v;
 }
 
-// Propagation: overwrite if NOT dirty (even if non-empty)
 function setIfNotDirtyOverwrite(row, fieldName, value){
   const inp = row.querySelector(`input[name='${fieldName}']`);
   if (!inp) return;
-  if (inp.dataset.dirty === "1") return;
+
+  const uid = row.dataset.uid || "";
+  if (isDirty(uid, fieldName)) return;
+
   const v = (value || '').toString();
   inp.value = v;
   inp.title = v;
 }
 
-// overwrite=false: initial fill (empty only)
-// overwrite=true : propagate edits from RDA (overwrite non-dirty)
-// NOTE: We intentionally do NOT touch series_descs for DAT rows.
-function refreshDatMatchesForKey(key, overwrite){
-  const meta = rdaMetaByKey.get(key);
-  if (!meta) return;
-  const rows = datRowsByKey.get(key) || [];
-  const setter = overwrite ? setIfNotDirtyOverwrite : setIfEmptyAndNotDirty;
+function clearIfNotDirty(row, fieldName){
+  const inp = row.querySelector(`input[name='${fieldName}']`);
+  if (!inp) return;
 
-  for (const row of rows){
-    setter(row, 'scan_ids', meta.scan ? String(meta.scan) : '');
-    setter(row, 'project_ids', meta.project ? String(meta.project) : '');
-    setter(row, 'subject_labels', meta.subject ? String(meta.subject) : '');
-    setter(row, 'experiment_labels', meta.session ? String(meta.session) : '');
-    // intentionally NOT updating 'series_descs'
+  const uid = row.dataset.uid || "";
+  if (isDirty(uid, fieldName)) return;
+
+  inp.value = "";
+  inp.title = "";
+}
+
+function setMatchWarnings(lines){
+  const box = document.getElementById("matchWarnings");
+  if (!box) return;
+  if (!lines || !lines.length){
+    box.style.display = "none";
+    box.textContent = "";
+    return;
+  }
+  box.style.display = "block";
+  box.innerHTML = "<b>Matching warning:</b><br>" + lines.map(x => `• ${x}`).join("<br>");
+}
+
+/* ===== Meta helpers ===== */
+function upsertRdaMeta(key, meta){
+  if (!key) return;
+  const arr = rdaMetasByKey.get(key) || [];
+  const idx = arr.findIndex(x => x.uid && meta.uid && x.uid === meta.uid);
+  if (idx >= 0) arr[idx] = meta;
+  else arr.push(meta);
+  rdaMetasByKey.set(key, arr);
+
+  // record display label for warnings (prefer RDA)
+  if (meta.series && String(meta.series).trim()){
+    seriesLabelByKey.set(key, String(meta.series).trim());
   }
 }
 
-function propagateFromRda(key){
-  const src = rdaRowByKey.get(key);
-  if (!src) return;
-  const vals = rowVals(src);
-
-  // keep meta map in sync with edits to RDA row
-  rdaMetaByKey.set(key, { ...vals, key });
-
-  // propagate edits to DAT rows (overwrite non-dirty)
-  refreshDatMatchesForKey(key, true);
+function removeRdaMeta(key, uid){
+  const arr = rdaMetasByKey.get(key) || [];
+  const next = arr.filter(x => !(x.uid && uid && x.uid === uid));
+  if (next.length) rdaMetasByKey.set(key, next);
+  else rdaMetasByKey.delete(key);
 }
 
+/* ===== Matching rules =====
+   We match EACH DAT row independently.
+   - Prefer date match: DAT StudyDate (from SeriesLOID) vs RDA StudyDate (from header)
+   - Allow up to 3 candidate RDAs; auto-populate only if:
+       * exactly 1 candidate after date filtering, OR
+       * multiple candidates remain BUT they all yield identical (scan,project,subject,session)
+   - Prevent reusing the same RDA (uid) for multiple DATs
+   - Propagate RDA edits to DAT (overwrite non-dirty)
+*/
+function sameDerivedMeta(cands){
+  if (!cands || cands.length < 2) return true;
+  const norm = x => ({
+    scan: String(x.scan||"").trim(),
+    project: String(x.project||"").trim(),
+    subject: String(x.subject||"").trim(),
+    session: String(x.session||"").trim(),
+  });
+  const a = norm(cands[0]);
+  for (let i=1;i<cands.length;i++){
+    const b = norm(cands[i]);
+    if (a.scan!==b.scan || a.project!==b.project || a.subject!==b.subject || a.session!==b.session) return false;
+  }
+  return true;
+}
+
+function updateMatchingForDatRow(datRow, rdaMetas, seriesLabel, usedRdaUids){
+  const warnings = [];
+  const datDate = normDate8(datRow.dataset.datStudyDate || "");
+  let candidates = (rdaMetas || []).slice();
+
+  // Narrow by date when possible
+  if (datDate && candidates.some(c => normDate8(c.studyDate))){
+    const filtered = candidates.filter(c => normDate8(c.studyDate) === datDate);
+    if (filtered.length) candidates = filtered;
+  }
+
+  const datName = datRow.dataset.filename || "";
+
+  if (candidates.length === 0){
+    warnings.push(`DAT "${datName}" (series "${seriesLabel}"): no matching RDA found${datDate ? ` for StudyDate ${datDate}` : ""} → please fill Project/Subject/Session/Scan manually.`);
+    ["scan_ids","project_ids","subject_labels","experiment_labels"].forEach(fn => clearIfNotDirty(datRow, fn));
+    return warnings;
+  }
+
+  if (candidates.length > 3){
+    warnings.push(`DAT "${datName}" (series "${seriesLabel}"): matches ${candidates.length} RDAs${datDate ? ` (after StudyDate check ${datDate})` : ""} → not auto-populating; please choose manually.`);
+    ["scan_ids","project_ids","subject_labels","experiment_labels"].forEach(fn => clearIfNotDirty(datRow, fn));
+    return warnings;
+  }
+
+  if (!(candidates.length === 1 || sameDerivedMeta(candidates))){
+    warnings.push(`DAT "${datName}" (series "${seriesLabel}"): matches ${candidates.length} RDAs${datDate ? ` (after StudyDate check ${datDate})` : ""} with different metadata → not auto-populating; please choose manually.`);
+    ["scan_ids","project_ids","subject_labels","experiment_labels"].forEach(fn => clearIfNotDirty(datRow, fn));
+    return warnings;
+  }
+
+  // Choose first (all identical or singleton)
+  const chosen = candidates[0];
+  const chosenUid = String(chosen.uid || "");
+  if (chosenUid && usedRdaUids.has(chosenUid)){
+    warnings.push(`DAT "${datName}" (series "${seriesLabel}"): would reuse the same RDA for multiple DATs → not auto-populating. Please fill manually or adjust series/date matching.`);
+    ["scan_ids","project_ids","subject_labels","experiment_labels"].forEach(fn => clearIfNotDirty(datRow, fn));
+    return warnings;
+  }
+  if (chosenUid) usedRdaUids.add(chosenUid);
+
+  // ✅ propagate RDA edits to DAT rows (unless DAT cells were manually edited)
+  setIfNotDirtyOverwrite(datRow, "scan_ids", chosen.scan || "");
+  setIfNotDirtyOverwrite(datRow, "project_ids", chosen.project || "");
+  setIfNotDirtyOverwrite(datRow, "subject_labels", chosen.subject || "");
+  setIfNotDirtyOverwrite(datRow, "experiment_labels", chosen.session || "");
+
+  return warnings;
+}
+
+function recomputeAllMatchingAndWarnings(){
+  const warns = [];
+  const usedRdaUids = new Set();
+
+  // Iterate each DAT row independently (so 2 DATs with same series can still match to 2 RDAs via date)
+  for (const [key, datRows] of datRowsByKey.entries()){
+    const rdaMetas = rdaMetasByKey.get(key) || [];
+    const label = seriesLabelByKey.get(key) || key;
+
+    for (const datRow of (datRows || [])){
+      const w = updateMatchingForDatRow(datRow, rdaMetas, label, usedRdaUids);
+      if (w && w.length) warns.push(...w);
+    }
+  }
+
+  setMatchWarnings(warns);
+}
+
+/* ===== Row builder ===== */
 function addRow(kind, fileName, meta){
   const tbody = document.getElementById('fileTableBody');
   if (!tbody){ err('tbody not found'); return; }
 
   const uidVal = (meta.uid || '').trim();
-
-  // Prevent duplicates by UID (allows duplicate filenames)
   if (uidVal && rowByUid.has(uidVal)) return;
 
   const row = document.createElement('tr');
@@ -590,14 +791,14 @@ function addRow(kind, fileName, meta){
   row.dataset.filename = fileName;
   row.dataset.uid = uidVal;
 
-  // hidden token: used to re-load staged bytes on retry (server-side)
+  // hidden token for staged bytes (server-side)
   const tok = document.createElement('input');
   tok.type = 'hidden';
   tok.name = 'file_tokens';
   tok.value = meta.token || '';
   row.appendChild(tok);
 
-  // hidden uid per row: backend uses to map row -> staged file even with duplicate filenames
+  // hidden uid per row (server uses to map to staged bytes, supports duplicate filenames)
   const uid = document.createElement('input');
   uid.type = 'hidden';
   uid.name = 'row_uids';
@@ -612,12 +813,11 @@ function addRow(kind, fileName, meta){
     inp.value = val || '';
     inp.title = val || '';
     if (readonly) inp.readOnly = true;
-
-    // Track manual edits on all editable cells (so we don't overwrite them later)
     if (!readonly){
-      inp.addEventListener('input', function(){ inp.dataset.dirty = '1'; });
+      inp.addEventListener('input', function(){
+        markDirty(row.dataset.uid || "", name);
+      });
     }
-
     td.appendChild(inp);
     return td;
   }
@@ -634,26 +834,40 @@ function addRow(kind, fileName, meta){
   btn.type = 'button';
   btn.className = 'remove-btn';
   btn.textContent = '❌';
+
   btn.addEventListener('click', function(){
     const key = row.dataset.seriesKey;
     const uid = row.dataset.uid;
 
     if (uid){
       rowByUid.delete(uid);
-      selectedFiles.delete(uid); // local file (no-op for token-only rows)
+      selectedFiles.delete(uid);
+      clearDirtyForUid(uid);
     }
 
     if (row.dataset.kind === 'rda'){
-      rdaRowByKey.delete(key);
-      rdaMetaByKey.delete(key);
+      const arr = rdaRowsByKey.get(key) || [];
+      rdaRowsByKey.set(key, arr.filter(r => r !== row));
+      if ((rdaRowsByKey.get(key) || []).length === 0) rdaRowsByKey.delete(key);
+      removeRdaMeta(key, uid);
     }
+
     if (row.dataset.kind === 'dat'){
       const arr = datRowsByKey.get(key) || [];
       datRowsByKey.set(key, arr.filter(r => r !== row));
+      if ((datRowsByKey.get(key) || []).length === 0) datRowsByKey.delete(key);
+    }
+
+    if (key){
+      const remainingRdas = (rdaRowsByKey.get(key) || []).length;
+      const remainingDats = (datRowsByKey.get(key) || []).length;
+      if (remainingRdas + remainingDats === 0) seriesLabelByKey.delete(key);
     }
 
     row.remove();
+    recomputeAllMatchingAndWarnings();
   });
+
   tdRemove.appendChild(btn);
   row.appendChild(tdRemove);
 
@@ -662,38 +876,64 @@ function addRow(kind, fileName, meta){
 
   const key = row.dataset.seriesKey;
 
+  if (key && meta.series && String(meta.series).trim()){
+    if (!seriesLabelByKey.has(key)) seriesLabelByKey.set(key, String(meta.series).trim());
+    if (kind === "rda") seriesLabelByKey.set(key, String(meta.series).trim());
+  }
+
   if (kind === 'rda'){
-    rdaRowByKey.set(key, row);
+    const arr = rdaRowsByKey.get(key) || [];
+    arr.push(row);
+    rdaRowsByKey.set(key, arr);
 
-    // seed meta map from row
-    const vals = rowVals(row);
-    if (key) rdaMetaByKey.set(key, { ...vals, key });
-
-    // propagate on edits
-    ['project_ids','subject_labels','experiment_labels','scan_ids','series_descs'].forEach(function(sel){
-      const inp = row.querySelector("input[name='" + sel + "']");
-      if (inp) inp.addEventListener('input', function(){ propagateFromRda(key); });
+    upsertRdaMeta(key, {
+      uid: uidVal,
+      scan: (meta.scan || ""),
+      project: (meta.project || ""),
+      subject: (meta.subject || ""),
+      session: (meta.session || ""),
+      series: (meta.series || ""),
+      studyDate: normDate8(meta.studyDate || "")
     });
 
-    // initial fill of any existing DATs (empty-only, not series)
-    if (key) refreshDatMatchesForKey(key, false);
-  } else {
+    // Update meta on edit + recompute
+    ['project_ids','subject_labels','experiment_labels','scan_ids','series_descs'].forEach(function(sel){
+      const inp = row.querySelector("input[name='" + sel + "']");
+      if (!inp) return;
+      inp.addEventListener('input', function(){
+        const vals = rowVals(row);
+        upsertRdaMeta(key, {
+          uid: uidVal,
+          scan: vals.scan || "",
+          project: vals.project || "",
+          subject: vals.subject || "",
+          session: vals.session || "",
+          series: vals.series || "",
+          // keep original StudyDate from header (if you later add an editable StudyDate col, swap this)
+          studyDate: normDate8(meta.studyDate || "")
+        });
+        if (vals.series && String(vals.series).trim()) seriesLabelByKey.set(key, String(vals.series).trim());
+        recomputeAllMatchingAndWarnings();
+      });
+    });
+
+  } else { // DAT
     const arr = datRowsByKey.get(key) || [];
     arr.push(row);
     datRowsByKey.set(key, arr);
-
-    // if we already know an RDA for this key, fill any missing dat fields now (empty-only, not series)
-    if (key) refreshDatMatchesForKey(key, false);
   }
+
+  if (meta.datStudyDate) row.dataset.datStudyDate = normDate8(meta.datStudyDate);
+
+  recomputeAllMatchingAndWarnings();
 }
 
-/* ===== File handling: additive (DO NOT CLEAR TABLE) ===== */
+/* ===== File handling (additive) ===== */
 async function handleFiles(fileList){
   try{
     const newlyPicked = Array.prototype.slice.call(fileList || []);
     log('Newly picked:', newlyPicked.map(f => f.name));
 
-    // accumulate local files by uid
     for (const f of newlyPicked){
       selectedFiles.set(fileId(f), f);
     }
@@ -709,30 +949,22 @@ async function handleFiles(fileList){
       catch(ex){ warn('FileReader failed for', f.name, ex); continue; }
 
       const hdr = parseRDA(txt);
+
+      const studyDateRaw = (hdr.StudyDate || "");
+      const studyDate = normDate8(studyDateRaw);
+
       const meta = {
-        scan: (hdr.SeriesNumber || '').trim ? (hdr.SeriesNumber || '').trim() : (hdr.SeriesNumber || ''),
+        scan:   (hdr.SeriesNumber || '').trim ? (hdr.SeriesNumber || '').trim() : (hdr.SeriesNumber || ''),
         series: (hdr.SeriesDescription || '').trim ? (hdr.SeriesDescription || '').trim() : (hdr.SeriesDescription || ''),
         project: sanitize(hdr.StudyDescription || ''),
         subject: sanitize(hdr.PatientName || ''),
         session: sanitize(hdr.PatientID || ''),
         key: normSeriesKey(hdr.SeriesDescription || ''),
-        uid
+        uid,
+        studyDate
       };
 
       addRow('rda', f.name, meta);
-
-      // seed meta map for matching later DAT rows (and fill existing dats empty-only)
-      if (meta.key){
-        rdaMetaByKey.set(meta.key, {
-          scan: meta.scan || '',
-          series: meta.series || '',   // kept but NOT propagated to DATs
-          project: meta.project || '',
-          subject: meta.subject || '',
-          session: meta.session || '',
-          key: meta.key
-        });
-        refreshDatMatchesForKey(meta.key, false);
-      }
     }
 
     // DATs next
@@ -741,19 +973,25 @@ async function handleFiles(fileList){
       const uid = fileId(f);
       if (rowByUid.has(uid)) continue;
 
-      const seriesRaw = parseDatSeries(f.name);
+      const parts = parseDatParts(f.name);
+      const seriesRaw = parts.series || parseDatSeries(f.name);
       const key = normSeriesKey(seriesRaw);
-      const meta = rdaMetaByKey.get(key) || { scan:'', series:'', project:'', subject:'', session:'', key };
 
-      // IMPORTANT: DAT series_descs comes from DAT filename parsing (seriesRaw), not RDA
+      let datDate = "";
+      try {
+        const txt = await readFileLatin1(f);
+        datDate = datStudyDateFromSeriesLoidText(txt) || "";
+      } catch(_) {}
+
       addRow('dat', f.name, {
-        scan: meta.scan,
+        scan: "",
         series: seriesRaw,
-        project: meta.project,
-        subject: meta.subject,
-        session: meta.session,
+        project: "",
+        subject: "",
+        session: "",
         key,
-        uid
+        uid,
+        datStudyDate: datDate
       });
     }
 
@@ -797,10 +1035,17 @@ window.addEventListener('DOMContentLoaded', function(){
     const rows = {{ pending_rows | tojson }};
     const tbody = document.getElementById('fileTableBody');
     tbody.innerHTML = '';
-    rdaRowByKey.clear(); datRowsByKey.clear();
-    rowByUid.clear(); rdaMetaByKey.clear();
-    selectedFiles.clear(); // restored rows are server-staged; no local File objects
 
+    // clear all maps
+    rowByUid.clear();
+    selectedFiles.clear();
+    rdaMetasByKey.clear();
+    datRowsByKey.clear();
+    rdaRowsByKey.clear();
+    seriesLabelByKey.clear();
+    dirtyByUid.clear();
+
+    // restore rows (server-staged; no local File objects)
     rows.forEach(r => {
       addRow(r.kind, r.filename, {
         scan: r.scan_id || '',
@@ -810,20 +1055,12 @@ window.addEventListener('DOMContentLoaded', function(){
         session: r.session || '',
         key: r.key || normSeriesKey(r.series_desc || ''),
         token: r.token || '',
-        uid: r.uid || '' // IMPORTANT: backend must persist uid in pending_rows
+        uid: r.uid || '',
+        studyDate: r.study_date || "",
+        datStudyDate: r.dat_study_date || ""   // harmless if not provided
       });
     });
 
-    // Reconstruct minimal RDA meta from restored rows so later DATs can match,
-    // and also so restored DATs can fill if their RDA is present.
-    document.querySelectorAll('#fileTableBody tr').forEach(row => {
-      if (row.dataset.kind !== 'rda') return;
-      const key = row.dataset.seriesKey || '';
-      if (!key) return;
-      const vals = rowVals(row);
-      rdaMetaByKey.set(key, { ...vals, key });
-      refreshDatMatchesForKey(key, false); // empty-only on restore
-    });
   } catch (e) {
     console.warn("Failed to restore pending rows", e);
   }
@@ -836,10 +1073,7 @@ window.addEventListener('DOMContentLoaded', function(){
 
   if (form){
     form.addEventListener('submit', function(){
-      // Ensure the <input type="file"> includes ONLY locally-selected, NOT-yet-staged files,
-      // and include upload_uids aligned with multipart order.
       try {
-        // remove old upload_uids inputs
         document.querySelectorAll("input[name='upload_uids']").forEach(n => n.remove());
 
         const dt = new DataTransfer();
@@ -848,8 +1082,6 @@ window.addEventListener('DOMContentLoaded', function(){
         rows.forEach(row => {
           const tok = (row.querySelector("input[name='file_tokens']")||{}).value || '';
           const uid = (row.querySelector("input[name='row_uids']")||{}).value || '';
-
-          // if already staged (token exists), don't re-upload bytes
           if (tok && tok.trim()) return;
 
           const f = selectedFiles.get(uid);
@@ -886,33 +1118,29 @@ window.addEventListener('DOMContentLoaded', function(){
   } catch (e) { warn('XNAT reload failed:', e); }
   {% endif %}
 
+  const shutdownToken = {{ shutdown_token | tojson }};
 
-const shutdownToken = {{ shutdown_token | tojson }};
+  function requestShutdown() {
+    try { navigator.sendBeacon(`/__quit?t=${encodeURIComponent(shutdownToken)}`); } catch(_) {}
+    try {
+      fetch(`/__quit?t=${encodeURIComponent(shutdownToken)}`, {
+        method: "POST", cache: "no-store", credentials: "same-origin", keepalive: true
+      }).catch(()=>{});
+    } catch(_) {}
+  }
 
-function requestShutdown() {
-  try { navigator.sendBeacon(`/__quit?t=${encodeURIComponent(shutdownToken)}`); } catch(_) {}
-  try {
-    fetch(`/__quit?t=${encodeURIComponent(shutdownToken)}`, {
-      method: "POST", cache: "no-store", credentials: "same-origin", keepalive: true
-    }).catch(()=>{});
-  } catch(_) {}
-}
-
-
-const quitBtn = document.getElementById("quitBtn");
-if (quitBtn) {
-  quitBtn.addEventListener("click", () => {
-    quitBtn.disabled = true;
-    quitBtn.textContent = "Quitting…";
-    requestShutdown();
-
-    document.body.innerHTML = `
-      <div style="font-family:system-ui;padding:2rem">
-        <h2>Uploader stopping…</h2>
-      </div>`;
-  });
-}
-
+  const quitBtn = document.getElementById("quitBtn");
+  if (quitBtn) {
+    quitBtn.addEventListener("click", () => {
+      quitBtn.disabled = true;
+      quitBtn.textContent = "Quitting…";
+      requestShutdown();
+      document.body.innerHTML = `
+        <div style="font-family:system-ui;padding:2rem">
+          <h2>Uploader stopping…</h2>
+        </div>`;
+    });
+  }
 });
 </script>
 </body>
@@ -1669,6 +1897,35 @@ def upload():
             if score and (not best or score > best[0]):
                 best = (score, r)
         return best[1] if best else None
+    
+    def _extract_twix_seriesloid_date(dat_bytes: bytes) -> Optional[str]:
+        """
+        Best-effort: find SeriesLOID in Siemens TWIX and extract YYYYMMDD date.
+        Returns YYYYMMDD or None.
+        """
+        # decode loosely; the file is binary but contains an ASCII config block
+        txt = dat_bytes.decode("latin-1", errors="ignore")
+
+        # Try SeriesLOID first
+        m = re.search(r'SeriesLOID"\>\{\s*"([^"]+)"\s*\}', txt)
+        if not m:
+            # some variants have slightly different formatting
+            m = re.search(r'SeriesLOID[^"\n]*\{\s*"([^"]+)"\s*\}', txt)
+        if not m:
+            return None
+
+        loid = m.group(1)
+
+        # Look for a 14-digit timestamp inside the LOID: YYYYMMDDHHMMSS
+        t = re.search(r'(\d{14})', loid)
+        if not t:
+            # sometimes only YYYYMMDD exists
+            t8 = re.search(r'(\d{8})', loid)
+            return t8.group(1) if t8 else None
+
+        ymdhms = t.group(1)
+        return ymdhms[:8]  # YYYYMMDD
+
 
     # ------------------------------------------------------------
     # Upload per row; keep failures in pending_rows
