@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xnat-mrs-uploader"
-version = "0.1.2"
+version = "0.1.3"
 description = "Local Flask app for uploading Siemens MRS (.rda/.dat) resources to XNAT"
 readme = "README.md"
 requires-python = ">=3.9"
