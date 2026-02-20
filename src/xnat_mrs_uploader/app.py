@@ -349,7 +349,6 @@ LOGIN_HTML = """
 </html>
 """
 
-
 UPLOAD_HTML = """
 <!doctype html>
 <html lang="en">
@@ -413,9 +412,8 @@ UPLOAD_HTML = """
       <div class="card-header">
         <h2>Raw Spectroscopy Data XNAT Uploader</h2>
         <div class="toolbar">
-  <button type="button" id="quitBtn" class="btn btn-ghost">Quit</button>
-</div>
-
+          <button type="button" id="quitBtn" class="btn btn-ghost">Quit</button>
+        </div>
       </div>
 
       {% with messages=get_flashed_messages() %}
@@ -427,9 +425,12 @@ UPLOAD_HTML = """
         <input id="rda_input" name="files" type="file" accept=".rda,.dat" multiple>
 
         <div class="subtle" style="margin-top:.35rem;">
-          TIP: RDA file headers are used to automatically determine Project, Subject, Session, & Scan. TWIX (.dat) files inherit this information
-          from their matching RDA file. If you manually edit any information for an RDA file, the edits will also apply to the matching .dat file, unless you separately change that row.
+          TIP: RDA file headers are used to automatically determine Project, Subject, Session, & Scan.
+          TWIX (.dat) files inherit this information only when matching is unambiguous.
+          If there are multiple DATs with the same series description, we will use StudyDate (from SeriesLOID) to match each DAT to the correct RDA when possible.
         </div>
+
+        <div id="matchWarnings" class="flash" style="display:none; border-color:#f5c2c0; background:#fdecea; color:#b12a2a;"></div>
 
         <div class="table-wrap">
           <table class="file-table">
@@ -450,7 +451,7 @@ UPLOAD_HTML = """
         </div>
 
         <div class="actions">
-          <button type="button" id="preview_xnat_btn" class="btn btn-ghost">👁 Preview XNAT Session(s)</button>
+          <button type="button" id="preview_xnat_btn" class="btn btn-ghost">Preview XNAT Session(s)</button>
           <button type="submit" class="btn btn-primary">Upload</button>
         </div>
       </form>
@@ -458,6 +459,7 @@ UPLOAD_HTML = """
   </div>
 
   <div id="spinner-overlay"><div class="spinner"></div>Uploading…</div>
+
 <script>
 /* ===== Debug helpers: surface any runtime error ===== */
 window.addEventListener('error', e => console.error('JS Error:', e.message, e.error));
@@ -465,27 +467,120 @@ function log(){ try{ console.log.apply(console, arguments); }catch(_){} }
 function warn(){ try{ console.warn.apply(console, arguments); }catch(_){} }
 function err(){ try{ console.error.apply(console, arguments); }catch(_){} }
 
-/* ===== State maps ===== */
+/* ===== State ===== */
 let previewWins = [];
-const rdaRowByKey = new Map();      // key -> rda <tr>
-const datRowsByKey = new Map();     // key -> [dat <tr>, ...]
-const rowByUid = new Map();         // uid -> <tr> (allows duplicate filenames)
-const rdaMetaByKey = new Map();     // key -> {scan,project,subject,session,series,key}  (series kept for RDA row only)
+const rowByUid = new Map();            // uid -> <tr>
+const selectedFiles = new Map();       // uid -> File
 
-/* ===== Accumulated local file selection (across multiple chooser actions) ===== */
-const selectedFiles = new Map();    // uid -> File
+// Dirty tracking that survives row removal/re-add because it is NOT stored on DOM nodes.
+const dirtyByUid = new Map();          // uid -> Set(fieldName)
+function markDirty(uid, fieldName){
+  if (!uid) return;
+  let s = dirtyByUid.get(uid);
+  if (!s){ s = new Set(); dirtyByUid.set(uid, s); }
+  s.add(fieldName);
+}
+function isDirty(uid, fieldName){
+  const s = uid ? dirtyByUid.get(uid) : null;
+  return !!(s && s.has(fieldName));
+}
+function clearDirtyForUid(uid){
+  if (!uid) return;
+  dirtyByUid.delete(uid);
+}
 
-function fileId(f){
-  return `${f.name}|||${f.size}|||${f.lastModified}`;
+// Matching structures
+const rdaMetasByKey = new Map();       // key -> [{uid, scan, project, subject, session, series, studyDate}, ...]
+const datRowsByKey  = new Map();       // key -> [dat <tr>, ...]
+const rdaRowsByKey  = new Map();       // key -> [rda <tr>, ...]
+
+// For printing full series description in warnings
+const seriesLabelByKey = new Map();    // key -> human-readable series description
+
+function fileId(f){ return `${f.name}|||${f.size}|||${f.lastModified}`; }
+
+/* ===== Freeze matching only through upload-attempt restore =====
+   - When restoring pending_rows after a (partial) failure, we freeze matching so it
+     DOES NOT clear/overwrite DAT targets that were already filled.
+   - We also suppress ALL matching warnings during frozen restore.
+   - As soon as the user changes anything (adds/removes files, edits any row),
+     we unfreeze and return to the original rules.
+*/
+let matchingFrozen = false;
+
+function freezeMatching(){
+  matchingFrozen = true;
+  setMatchWarnings([]); // hide any warnings immediately
+}
+
+function unfreezeMatching(){
+  if (!matchingFrozen) return;
+  matchingFrozen = false;
+  recomputeAllMatchingAndWarnings();
 }
 
 /* ===== Utils ===== */
 function sanitize(txt){ return String(txt||'').trim().replace(/\\W+/g,'_').replace(/^_|_$/g,''); }
-function normSeriesKey(txt){ return String(txt||'').toLowerCase().replace(/[_-]/g,''); }
+function normSeriesKey(txt){
+  return String(txt||'')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ''); // remove spaces, underscores, punctuation, etc.
+}
+function normDate8(x){
+  const s = String(x || "").replace(/\\D+/g, "");
+  return s.length >= 8 ? s.slice(0,8) : s;
+}
+
+/* ===== Persist DAT StudyDate across failed uploads (no File object on restore) ===== */
+const DAT_DATE_STORE_KEY = "xnat_uploader_dat_studydate_by_uid_v1";
+
+function _loadDatDateStore(){
+  try{
+    const raw = sessionStorage.getItem(DAT_DATE_STORE_KEY);
+    return raw ? (JSON.parse(raw) || {}) : {};
+  }catch(_){ return {}; }
+}
+function _saveDatDateStore(obj){
+  try{ sessionStorage.setItem(DAT_DATE_STORE_KEY, JSON.stringify(obj || {})); }catch(_){}
+}
+function rememberDatStudyDate(uid, date8){
+  uid = String(uid || "");
+  const d = normDate8(date8 || "");
+  if (!uid || !d) return;
+  const store = _loadDatDateStore();
+  store[uid] = d;
+  _saveDatDateStore(store);
+}
+function recallDatStudyDate(uid){
+  uid = String(uid || "");
+  if (!uid) return "";
+  const store = _loadDatDateStore();
+  return normDate8(store[uid] || "");
+}
+function forgetDatStudyDate(uid){
+  uid = String(uid || "");
+  if (!uid) return;
+  const store = _loadDatDateStore();
+  if (store.hasOwnProperty(uid)){
+    delete store[uid];
+    _saveDatDateStore(store);
+  }
+}
+
+// meas_MID00446_FID07106_mrs_mrsref_acq_PRESS_voi_Lacc.dat
+function parseDatParts(name){
+  const s = String(name||'');
+  const m = s.match(/^meas_(MID\\d+)_?(FID\\d+)_([\\s\\S]+)\\.dat$/i);
+  if (!m) return { mid:"", fid:"", series:"" };
+  return { mid: m[1] || "", fid: m[2] || "", series: m[3] || "" };
+}
+
+// legacy fallback
 function parseDatSeries(name){
   const m = String(name||'').match(/^meas_[^_]+_[^_]+_(.+)\\.dat$/i);
   return m ? m[1] : '';
 }
+
 function readFileText(file){
   return new Promise((resolve,reject)=>{
     const r = new FileReader();
@@ -494,6 +589,7 @@ function readFileText(file){
     try { r.readAsText(file, 'ISO-8859-1'); } catch (_) { r.readAsText(file); }
   });
 }
+
 function parseRDA(text){
   try{
     const start='>>> Begin of header <<<', end='>>> End of header <<<';
@@ -513,6 +609,49 @@ function parseRDA(text){
   }catch(e){ err('parseRDA failed:', e); return {}; }
 }
 
+/* ===== DAT StudyDate best-effort (SeriesLOID) ===== */
+function datStudyDateFromSeriesLoidText(txt){
+  if (!txt) return "";
+  const i = txt.indexOf('SeriesLOID');
+  if (i < 0) return "";
+
+  const windowTxt = txt.slice(i, i + 1200);
+  let loid = "";
+
+  let m = windowTxt.match(/SeriesLOID[\\s\\S]{0,400}?\\{\\s*"([^"]{10,240})"\\s*\\}/);
+  if (m) loid = m[1];
+
+  if (!loid){
+    m = windowTxt.match(/SeriesLOID[\\s\\S]{0,400}?"([^"]{10,240})"/);
+    if (m) loid = m[1];
+  }
+
+  if (!loid) return "";
+  const d14 = loid.match(/(20\\d{12})/);
+  if (!d14) return "";
+  return d14[1].slice(0, 8);
+}
+
+function readFileLatin1(file){
+  return new Promise((resolve,reject)=>{
+    const r = new FileReader();
+    r.onload = e => {
+      try {
+        const buf = e.target.result;
+        const bytes = new Uint8Array(buf);
+        let s = "";
+        const chunk = 0x8000;
+        for (let i=0;i<bytes.length;i+=chunk){
+          s += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
+        }
+        resolve(s);
+      } catch(err){ reject(err); }
+    };
+    r.onerror = reject;
+    r.readAsArrayBuffer(file);
+  });
+}
+
 /* ===== Table helpers ===== */
 function rowVals(row){
   return {
@@ -524,64 +663,192 @@ function rowVals(row){
   };
 }
 
-// Initial fill: only fill if empty AND not dirty
-function setIfEmptyAndNotDirty(row, fieldName, value){
-  const inp = row.querySelector(`input[name='${fieldName}']`);
-  if (!inp) return;
-  if (inp.dataset.dirty === "1") return;
-  if ((inp.value || '').trim()) return;  // only fill empty
-  const v = (value || '').toString();
-  inp.value = v;
-  inp.title = v;
+function datHasTarget(row){
+  const v = rowVals(row);
+  return !!(v.scan || v.project || v.subject || v.session);
 }
 
-// Propagation: overwrite if NOT dirty (even if non-empty)
+function maybeClearDatTargets(row){
+  // During frozen restore, preserve any DAT row that already has a chosen target.
+  if (row && row.dataset && row.dataset.kind === "dat" && matchingFrozen && datHasTarget(row)) return;
+  ["scan_ids","project_ids","subject_labels","experiment_labels"].forEach(fn => clearIfNotDirty(row, fn));
+}
+
 function setIfNotDirtyOverwrite(row, fieldName, value){
   const inp = row.querySelector(`input[name='${fieldName}']`);
   if (!inp) return;
-  if (inp.dataset.dirty === "1") return;
+  const uid = row.dataset.uid || "";
+  if (isDirty(uid, fieldName)) return;
   const v = (value || '').toString();
   inp.value = v;
   inp.title = v;
 }
 
-// overwrite=false: initial fill (empty only)
-// overwrite=true : propagate edits from RDA (overwrite non-dirty)
-// NOTE: We intentionally do NOT touch series_descs for DAT rows.
-function refreshDatMatchesForKey(key, overwrite){
-  const meta = rdaMetaByKey.get(key);
-  if (!meta) return;
-  const rows = datRowsByKey.get(key) || [];
-  const setter = overwrite ? setIfNotDirtyOverwrite : setIfEmptyAndNotDirty;
+function clearIfNotDirty(row, fieldName){
+  const inp = row.querySelector(`input[name='${fieldName}']`);
+  if (!inp) return;
+  const uid = row.dataset.uid || "";
+  if (isDirty(uid, fieldName)) return;
+  inp.value = "";
+  inp.title = "";
+}
 
-  for (const row of rows){
-    setter(row, 'scan_ids', meta.scan ? String(meta.scan) : '');
-    setter(row, 'project_ids', meta.project ? String(meta.project) : '');
-    setter(row, 'subject_labels', meta.subject ? String(meta.subject) : '');
-    setter(row, 'experiment_labels', meta.session ? String(meta.session) : '');
-    // intentionally NOT updating 'series_descs'
+function setMatchWarnings(lines){
+  const box = document.getElementById("matchWarnings");
+  if (!box) return;
+  if (!lines || !lines.length){
+    box.style.display = "none";
+    box.textContent = "";
+    return;
+  }
+  box.style.display = "block";
+  box.innerHTML = "<b>Matching warning:</b><br>" + lines.map(x => `• ${x}`).join("<br>");
+}
+
+/* ===== Meta helpers ===== */
+function upsertRdaMeta(key, meta){
+  if (!key) return;
+  const arr = rdaMetasByKey.get(key) || [];
+  const idx = arr.findIndex(x => x.uid && meta.uid && x.uid === meta.uid);
+  if (idx >= 0) arr[idx] = meta;
+  else arr.push(meta);
+  rdaMetasByKey.set(key, arr);
+
+  if (meta.series && String(meta.series).trim()){
+    seriesLabelByKey.set(key, String(meta.series).trim());
   }
 }
 
-function propagateFromRda(key){
-  const src = rdaRowByKey.get(key);
-  if (!src) return;
-  const vals = rowVals(src);
-
-  // keep meta map in sync with edits to RDA row
-  rdaMetaByKey.set(key, { ...vals, key });
-
-  // propagate edits to DAT rows (overwrite non-dirty)
-  refreshDatMatchesForKey(key, true);
+function removeRdaMeta(key, uid){
+  const arr = rdaMetasByKey.get(key) || [];
+  const next = arr.filter(x => !(x.uid && uid && x.uid === uid));
+  if (next.length) rdaMetasByKey.set(key, next);
+  else rdaMetasByKey.delete(key);
 }
 
+/* ===== Matching rules (original behavior; warnings suppressed and DAT targets preserved only during frozen restore) ===== */
+function updateMatchingForKey(key){
+  if (!key) return [];
+  const warnings = [];
+
+  const datRows = datRowsByKey.get(key) || [];
+  const rdaMetasAll = rdaMetasByKey.get(key) || [];
+  const label = seriesLabelByKey.get(key) || key;
+
+  function sameDerivedMeta(cands){
+    if (!cands || cands.length < 2) return true;
+    const norm = x => ({
+      scan: String(x.scan||"").trim(),
+      project: String(x.project||"").trim(),
+      subject: String(x.subject||"").trim(),
+      session: String(x.session||"").trim(),
+    });
+    const a = norm(cands[0]);
+    for (let i=1;i<cands.length;i++){
+      const b = norm(cands[i]);
+      if (a.scan!==b.scan || a.project!==b.project || a.subject!==b.subject || a.session!==b.session) return false;
+    }
+    return true;
+  }
+
+  const datByDate = new Map(); // date -> [rows]
+  for (const row of datRows){
+    const d = normDate8(row.dataset.datStudyDate || "");
+    if (!d){
+      if (!matchingFrozen) {
+        warnings.push(`DAT "${row.dataset.filename || ''}" (series "${label}"): could not read StudyDate from DAT → not auto-populating.`);
+      }
+      maybeClearDatTargets(row);
+      continue;
+    }
+    const arr = datByDate.get(d) || [];
+    arr.push(row);
+    datByDate.set(d, arr);
+  }
+
+  for (const [datDate, groupRows] of datByDate.entries()){
+    const candidates = rdaMetasAll.filter(r => normDate8(r.studyDate || "") === datDate);
+
+    if (candidates.length === 0){
+      for (const row of groupRows){
+        if (!matchingFrozen) {
+          warnings.push(`DAT "${row.dataset.filename || ''}" (series "${label}"): no RDA for StudyDate ${datDate} → not auto-populating.`);
+        }
+        maybeClearDatTargets(row);
+      }
+      continue;
+    }
+
+    if (candidates.length > 3){
+      for (const row of groupRows){
+        if (!matchingFrozen) {
+          warnings.push(`DAT "${row.dataset.filename || ''}" (series "${label}"): matches ${candidates.length} RDAs for StudyDate ${datDate} → not auto-populating; please choose manually.`);
+        }
+        maybeClearDatTargets(row);
+      }
+      continue;
+    }
+
+    if (groupRows.length > candidates.length){
+      for (const row of groupRows){
+        if (!matchingFrozen) {
+          warnings.push(`DAT "${row.dataset.filename || ''}" (series "${label}"): ${groupRows.length} DATs but only ${candidates.length} RDA(s) for StudyDate ${datDate} → would reuse an RDA → not auto-populating.`);
+        }
+        maybeClearDatTargets(row);
+      }
+      continue;
+    }
+
+    if (candidates.length > 1 && !sameDerivedMeta(candidates)){
+      for (const row of groupRows){
+        if (!matchingFrozen) {
+          warnings.push(`DAT "${row.dataset.filename || ''}" (series "${label}"): matches ${candidates.length} RDAs for StudyDate ${datDate} with different metadata → ambiguous 1:1 assignment → not auto-populating.`);
+        }
+        maybeClearDatTargets(row);
+      }
+      continue;
+    }
+
+    const m = candidates[0];
+    for (const row of groupRows){
+      // During frozen restore, do not overwrite already-filled DAT targets.
+      if (matchingFrozen && row.dataset.kind === "dat" && datHasTarget(row)) continue;
+
+      setIfNotDirtyOverwrite(row, "scan_ids", m.scan || "");
+      setIfNotDirtyOverwrite(row, "project_ids", m.project || "");
+      setIfNotDirtyOverwrite(row, "subject_labels", m.subject || "");
+      setIfNotDirtyOverwrite(row, "experiment_labels", m.session || "");
+    }
+  }
+
+  return warnings;
+}
+
+function recomputeAllMatchingAndWarnings(){
+  // During frozen restore: suppress all matching warnings (and hide box)
+  if (matchingFrozen){
+    setMatchWarnings([]);
+    return;
+  }
+
+  const warns = [];
+  const allKeys = new Set();
+  for (const k of rdaMetasByKey.keys()) allKeys.add(k);
+  for (const k of datRowsByKey.keys()) allKeys.add(k);
+
+  for (const key of allKeys){
+    const w = updateMatchingForKey(key);
+    if (w && w.length) warns.push(...w);
+  }
+  setMatchWarnings(warns);
+}
+
+/* ===== Row builder ===== */
 function addRow(kind, fileName, meta){
   const tbody = document.getElementById('fileTableBody');
   if (!tbody){ err('tbody not found'); return; }
 
   const uidVal = (meta.uid || '').trim();
-
-  // Prevent duplicates by UID (allows duplicate filenames)
   if (uidVal && rowByUid.has(uidVal)) return;
 
   const row = document.createElement('tr');
@@ -590,19 +857,24 @@ function addRow(kind, fileName, meta){
   row.dataset.filename = fileName;
   row.dataset.uid = uidVal;
 
-  // hidden token: used to re-load staged bytes on retry (server-side)
   const tok = document.createElement('input');
   tok.type = 'hidden';
   tok.name = 'file_tokens';
   tok.value = meta.token || '';
   row.appendChild(tok);
 
-  // hidden uid per row: backend uses to map row -> staged file even with duplicate filenames
   const uid = document.createElement('input');
   uid.type = 'hidden';
   uid.name = 'row_uids';
   uid.value = uidVal;
   row.appendChild(uid);
+
+  // hidden DAT StudyDate per row (YYYYMMDD). Always present (blank for RDA).
+  const dsd = document.createElement('input');
+  dsd.type = 'hidden';
+  dsd.name = 'dat_study_dates';
+  dsd.value = meta.datStudyDate ? normDate8(meta.datStudyDate) : '';
+  row.appendChild(dsd);
 
   function mkCell(name, val, readonly){
     const td = document.createElement('td');
@@ -612,12 +884,13 @@ function addRow(kind, fileName, meta){
     inp.value = val || '';
     inp.title = val || '';
     if (readonly) inp.readOnly = true;
-
-    // Track manual edits on all editable cells (so we don't overwrite them later)
     if (!readonly){
-      inp.addEventListener('input', function(){ inp.dataset.dirty = '1'; });
+      inp.addEventListener('input', function(){
+        markDirty(row.dataset.uid || "", name);
+        // Any edits are a "meaningful action" -> return to original matching rules.
+        unfreezeMatching();
+      });
     }
-
     td.appendChild(inp);
     return td;
   }
@@ -634,26 +907,45 @@ function addRow(kind, fileName, meta){
   btn.type = 'button';
   btn.className = 'remove-btn';
   btn.textContent = '❌';
+
   btn.addEventListener('click', function(){
+    // Removing is a meaningful action -> return to original rules
+    unfreezeMatching();
+
     const key = row.dataset.seriesKey;
     const uid = row.dataset.uid;
 
     if (uid){
       rowByUid.delete(uid);
-      selectedFiles.delete(uid); // local file (no-op for token-only rows)
+      selectedFiles.delete(uid);
+      clearDirtyForUid(uid);
+      // also forget persisted DAT StudyDate for this uid (harmless if it was an RDA)
+      forgetDatStudyDate(uid);
     }
 
     if (row.dataset.kind === 'rda'){
-      rdaRowByKey.delete(key);
-      rdaMetaByKey.delete(key);
+      const arr = rdaRowsByKey.get(key) || [];
+      rdaRowsByKey.set(key, arr.filter(r => r !== row));
+      if ((rdaRowsByKey.get(key) || []).length === 0) rdaRowsByKey.delete(key);
+      removeRdaMeta(key, uid);
     }
+
     if (row.dataset.kind === 'dat'){
       const arr = datRowsByKey.get(key) || [];
       datRowsByKey.set(key, arr.filter(r => r !== row));
+      if ((datRowsByKey.get(key) || []).length === 0) datRowsByKey.delete(key);
+    }
+
+    if (key){
+      const remainingRdas = (rdaRowsByKey.get(key) || []).length;
+      const remainingDats = (datRowsByKey.get(key) || []).length;
+      if (remainingRdas + remainingDats === 0) seriesLabelByKey.delete(key);
     }
 
     row.remove();
+    recomputeAllMatchingAndWarnings();
   });
+
   tdRemove.appendChild(btn);
   row.appendChild(tdRemove);
 
@@ -662,43 +954,84 @@ function addRow(kind, fileName, meta){
 
   const key = row.dataset.seriesKey;
 
+  if (key && meta.series && String(meta.series).trim()){
+    if (!seriesLabelByKey.has(key)) seriesLabelByKey.set(key, String(meta.series).trim());
+    if (kind === "rda") seriesLabelByKey.set(key, String(meta.series).trim());
+  }
+
   if (kind === 'rda'){
-    rdaRowByKey.set(key, row);
+    const arr = rdaRowsByKey.get(key) || [];
+    arr.push(row);
+    rdaRowsByKey.set(key, arr);
 
-    // seed meta map from row
-    const vals = rowVals(row);
-    if (key) rdaMetaByKey.set(key, { ...vals, key });
-
-    // propagate on edits
-    ['project_ids','subject_labels','experiment_labels','scan_ids','series_descs'].forEach(function(sel){
-      const inp = row.querySelector("input[name='" + sel + "']");
-      if (inp) inp.addEventListener('input', function(){ propagateFromRda(key); });
+    upsertRdaMeta(key, {
+      uid: uidVal,
+      scan: (meta.scan || ""),
+      project: (meta.project || ""),
+      subject: (meta.subject || ""),
+      session: (meta.session || ""),
+      series: (meta.series || ""),
+      studyDate: normDate8(meta.studyDate || "")
     });
 
-    // initial fill of any existing DATs (empty-only, not series)
-    if (key) refreshDatMatchesForKey(key, false);
-  } else {
+    ['project_ids','subject_labels','experiment_labels','scan_ids','series_descs'].forEach(function(sel){
+      const inp = row.querySelector("input[name='" + sel + "']");
+      if (!inp) return;
+      inp.addEventListener('input', function(){
+        // Editing RDA metadata should immediately return to original matching rules
+        unfreezeMatching();
+
+        const vals = rowVals(row);
+        upsertRdaMeta(key, {
+          uid: uidVal,
+          scan: vals.scan || "",
+          project: vals.project || "",
+          subject: vals.subject || "",
+          session: vals.session || "",
+          series: vals.series || "",
+          studyDate: normDate8(meta.studyDate || "")
+        });
+        if (vals.series && String(vals.series).trim()) seriesLabelByKey.set(key, String(vals.series).trim());
+        recomputeAllMatchingAndWarnings();
+      });
+    });
+
+  } else { // DAT
     const arr = datRowsByKey.get(key) || [];
     arr.push(row);
     datRowsByKey.set(key, arr);
-
-    // if we already know an RDA for this key, fill any missing dat fields now (empty-only, not series)
-    if (key) refreshDatMatchesForKey(key, false);
   }
+
+  // ✅ Persist & rehydrate DAT StudyDate (DAT rows only)
+  let rehydrated = "";
+  if (kind === "dat") {
+    rehydrated = normDate8(meta.datStudyDate || "") || recallDatStudyDate(uidVal) || "";
+    if (rehydrated) {
+      row.dataset.datStudyDate = rehydrated;     // matching logic reads this
+      rememberDatStudyDate(uidVal, rehydrated);  // client-side persistence
+    } else {
+      delete row.dataset.datStudyDate;
+    }
+  } else {
+    delete row.dataset.datStudyDate;
+  }
+
+  const dsdInp = row.querySelector("input[name='dat_study_dates']");
+  if (dsdInp) dsdInp.value = rehydrated;
+
+  recomputeAllMatchingAndWarnings();
 }
 
-/* ===== File handling: additive (DO NOT CLEAR TABLE) ===== */
+/* ===== File handling (additive) ===== */
 async function handleFiles(fileList){
   try{
     const newlyPicked = Array.prototype.slice.call(fileList || []);
     log('Newly picked:', newlyPicked.map(f => f.name));
 
-    // accumulate local files by uid
     for (const f of newlyPicked){
       selectedFiles.set(fileId(f), f);
     }
 
-    // RDAs first
     const rdaFiles = newlyPicked.filter(f => /\\.rda$/i.test(f.name));
     for (const f of rdaFiles){
       const uid = fileId(f);
@@ -709,51 +1042,49 @@ async function handleFiles(fileList){
       catch(ex){ warn('FileReader failed for', f.name, ex); continue; }
 
       const hdr = parseRDA(txt);
+      const studyDate = normDate8(hdr.StudyDate || "");
+
       const meta = {
-        scan: (hdr.SeriesNumber || '').trim ? (hdr.SeriesNumber || '').trim() : (hdr.SeriesNumber || ''),
+        scan:   (hdr.SeriesNumber || '').trim ? (hdr.SeriesNumber || '').trim() : (hdr.SeriesNumber || ''),
         series: (hdr.SeriesDescription || '').trim ? (hdr.SeriesDescription || '').trim() : (hdr.SeriesDescription || ''),
         project: sanitize(hdr.StudyDescription || ''),
         subject: sanitize(hdr.PatientName || ''),
         session: sanitize(hdr.PatientID || ''),
         key: normSeriesKey(hdr.SeriesDescription || ''),
-        uid
+        uid,
+        studyDate
       };
 
       addRow('rda', f.name, meta);
-
-      // seed meta map for matching later DAT rows (and fill existing dats empty-only)
-      if (meta.key){
-        rdaMetaByKey.set(meta.key, {
-          scan: meta.scan || '',
-          series: meta.series || '',   // kept but NOT propagated to DATs
-          project: meta.project || '',
-          subject: meta.subject || '',
-          session: meta.session || '',
-          key: meta.key
-        });
-        refreshDatMatchesForKey(meta.key, false);
-      }
     }
 
-    // DATs next
     const datFiles = newlyPicked.filter(f => /\\.dat$/i.test(f.name));
     for (const f of datFiles){
       const uid = fileId(f);
       if (rowByUid.has(uid)) continue;
 
-      const seriesRaw = parseDatSeries(f.name);
+      const parts = parseDatParts(f.name);
+      const seriesRaw = parts.series || parseDatSeries(f.name);
       const key = normSeriesKey(seriesRaw);
-      const meta = rdaMetaByKey.get(key) || { scan:'', series:'', project:'', subject:'', session:'', key };
 
-      // IMPORTANT: DAT series_descs comes from DAT filename parsing (seriesRaw), not RDA
+      let datDate = "";
+      try {
+        const txt = await readFileLatin1(f);
+        datDate = datStudyDateFromSeriesLoidText(txt) || "";
+      } catch(_) {}
+
+      datDate = normDate8(datDate || "");
+      if (datDate) rememberDatStudyDate(uid, datDate);
+
       addRow('dat', f.name, {
-        scan: meta.scan,
+        scan: "",
         series: seriesRaw,
-        project: meta.project,
-        subject: meta.subject,
-        session: meta.session,
+        project: "",
+        subject: "",
+        session: "",
         key,
-        uid
+        uid,
+        datStudyDate: datDate
       });
     }
 
@@ -790,18 +1121,34 @@ function openXNATPreviewsFromTable() {
 window.addEventListener('DOMContentLoaded', function(){
   const fileInput = document.getElementById('rda_input');
   const form = document.getElementById('uploadForm');
+  const tbody = document.getElementById('fileTableBody');
   if (!fileInput){ err('#rda_input missing'); return; }
 
   {% if pending_rows %}
   try {
-    const rows = {{ pending_rows | tojson }};
-    const tbody = document.getElementById('fileTableBody');
-    tbody.innerHTML = '';
-    rdaRowByKey.clear(); datRowsByKey.clear();
-    rowByUid.clear(); rdaMetaByKey.clear();
-    selectedFiles.clear(); // restored rows are server-staged; no local File objects
+    // We are restoring rows from a previous upload attempt.
+    // Freeze matching so already-filled DAT targets are NOT cleared/overwritten on restore.
+    // Also: suppress all matching warnings during the frozen restore.
+    freezeMatching();
 
+    const rows = {{ pending_rows | tojson }};
+    tbody.innerHTML = '';
+
+    rowByUid.clear();
+    selectedFiles.clear();
+    rdaMetasByKey.clear();
+    datRowsByKey.clear();
+    rdaRowsByKey.clear();
+    seriesLabelByKey.clear();
+    dirtyByUid.clear();
+
+    // restore rows (server-staged; no local File objects)
     rows.forEach(r => {
+      const uid = r.uid || '';
+      // if backend didn't provide dat_study_date, rehydrate from sessionStorage
+      const restoredDatDate = normDate8(r.dat_study_date || "") || recallDatStudyDate(uid) || "";
+      if (restoredDatDate) rememberDatStudyDate(uid, restoredDatDate);
+
       addRow(r.kind, r.filename, {
         scan: r.scan_id || '',
         series: r.series_desc || '',
@@ -810,36 +1157,41 @@ window.addEventListener('DOMContentLoaded', function(){
         session: r.session || '',
         key: r.key || normSeriesKey(r.series_desc || ''),
         token: r.token || '',
-        uid: r.uid || '' // IMPORTANT: backend must persist uid in pending_rows
+        uid: uid,
+        studyDate: r.study_date || "",
+        datStudyDate: restoredDatDate
       });
     });
 
-    // Reconstruct minimal RDA meta from restored rows so later DATs can match,
-    // and also so restored DATs can fill if their RDA is present.
-    document.querySelectorAll('#fileTableBody tr').forEach(row => {
-      if (row.dataset.kind !== 'rda') return;
-      const key = row.dataset.seriesKey || '';
-      if (!key) return;
-      const vals = rowVals(row);
-      rdaMetaByKey.set(key, { ...vals, key });
-      refreshDatMatchesForKey(key, false); // empty-only on restore
-    });
+    // Ensure warnings stay hidden during frozen restore
+    setMatchWarnings([]);
+
   } catch (e) {
     console.warn("Failed to restore pending rows", e);
   }
   {% endif %}
 
-  fileInput.addEventListener('change', function(e){ handleFiles(e.target.files); });
+  // Any file add/change is a meaningful action -> unfreeze then process
+  fileInput.addEventListener('change', function(e){
+    unfreezeMatching();
+    handleFiles(e.target.files);
+  });
+
+  // Any edits anywhere in the table are meaningful -> unfreeze (capture catches early)
+  if (tbody){
+    tbody.addEventListener('input', function(){ unfreezeMatching(); }, { capture: true });
+    tbody.addEventListener('click', function(ev){
+      const b = ev.target && ev.target.closest && ev.target.closest('.remove-btn');
+      if (b) unfreezeMatching();
+    }, { capture: true });
+  }
 
   const prevBtn = document.getElementById('preview_xnat_btn');
   if (prevBtn) prevBtn.addEventListener('click', openXNATPreviewsFromTable);
 
   if (form){
     form.addEventListener('submit', function(){
-      // Ensure the <input type="file"> includes ONLY locally-selected, NOT-yet-staged files,
-      // and include upload_uids aligned with multipart order.
       try {
-        // remove old upload_uids inputs
         document.querySelectorAll("input[name='upload_uids']").forEach(n => n.remove());
 
         const dt = new DataTransfer();
@@ -848,8 +1200,6 @@ window.addEventListener('DOMContentLoaded', function(){
         rows.forEach(row => {
           const tok = (row.querySelector("input[name='file_tokens']")||{}).value || '';
           const uid = (row.querySelector("input[name='row_uids']")||{}).value || '';
-
-          // if already staged (token exists), don't re-upload bytes
           if (tok && tok.trim()) return;
 
           const f = selectedFiles.get(uid);
@@ -886,38 +1236,35 @@ window.addEventListener('DOMContentLoaded', function(){
   } catch (e) { warn('XNAT reload failed:', e); }
   {% endif %}
 
+  const shutdownToken = {{ shutdown_token | tojson }};
 
-const shutdownToken = {{ shutdown_token | tojson }};
+  function requestShutdown() {
+    try { navigator.sendBeacon(`/__quit?t=${encodeURIComponent(shutdownToken)}`); } catch(_) {}
+    try {
+      fetch(`/__quit?t=${encodeURIComponent(shutdownToken)}`, {
+        method: "POST", cache: "no-store", credentials: "same-origin", keepalive: true
+      }).catch(()=>{});
+    } catch(_) {}
+  }
 
-function requestShutdown() {
-  try { navigator.sendBeacon(`/__quit?t=${encodeURIComponent(shutdownToken)}`); } catch(_) {}
-  try {
-    fetch(`/__quit?t=${encodeURIComponent(shutdownToken)}`, {
-      method: "POST", cache: "no-store", credentials: "same-origin", keepalive: true
-    }).catch(()=>{});
-  } catch(_) {}
-}
-
-
-const quitBtn = document.getElementById("quitBtn");
-if (quitBtn) {
-  quitBtn.addEventListener("click", () => {
-    quitBtn.disabled = true;
-    quitBtn.textContent = "Quitting…";
-    requestShutdown();
-
-    document.body.innerHTML = `
-      <div style="font-family:system-ui;padding:2rem">
-        <h2>Uploader stopping…</h2>
-      </div>`;
-  });
-}
-
+  const quitBtn = document.getElementById("quitBtn");
+  if (quitBtn) {
+    quitBtn.addEventListener("click", () => {
+      quitBtn.disabled = true;
+      quitBtn.textContent = "Quitting…";
+      requestShutdown();
+      document.body.innerHTML = `
+        <div style="font-family:system-ui;padding:2rem">
+          <h2>Uploader stopping…</h2>
+        </div>`;
+    });
+  }
 });
 </script>
 </body>
 </html>
 """
+
 
 # ---------------------------------------------------------------------------
 # Backend helpers
@@ -1459,21 +1806,27 @@ def upload():
         return redirect(url_for("login"))
 
     import hashlib
+    import logging
+    import os
+    import re
+    import urllib.parse
+    from typing import Optional
 
     label = "MRS"
 
     # ---- Table arrays (authoritative state) ----
-    names = request.form.getlist('file_names')
-    scans = request.form.getlist('scan_ids')
-    descs = request.form.getlist('series_descs')
-    projs = request.form.getlist('project_ids')
-    subs  = request.form.getlist('subject_labels')
-    exps  = request.form.getlist('experiment_labels')
-    toks  = request.form.getlist('file_tokens')   # hidden input per row (may be blank)
-    row_uids = request.form.getlist('row_uids')   # hidden input per row (may be blank for old sessions)
+    names = request.form.getlist("file_names")
+    scans = request.form.getlist("scan_ids")
+    descs = request.form.getlist("series_descs")
+    projs = request.form.getlist("project_ids")
+    subs  = request.form.getlist("subject_labels")
+    exps  = request.form.getlist("experiment_labels")
+    toks  = request.form.getlist("file_tokens")        # hidden input per row (may be blank)
+    row_uids = request.form.getlist("row_uids")        # hidden input per row (may be blank for old sessions)
+    dat_study_dates = request.form.getlist("dat_study_dates")  # hidden input per row (DAT-only; may be blank)
 
     # For the newly-uploaded multipart files only (order must match request.files.getlist("files"))
-    upload_uids = request.form.getlist('upload_uids')
+    upload_uids = request.form.getlist("upload_uids")
 
     def _to_int_or_none(x: Optional[str]) -> Optional[int]:
         try:
@@ -1489,6 +1842,37 @@ def upload():
                 h.update(chunk)
         return h.hexdigest()
 
+    def _norm_date8(x: Optional[str]) -> str:
+        s = re.sub(r"\D+", "", (x or ""))
+        return s[:8] if len(s) >= 8 else s
+
+    def _extract_twix_seriesloid_date(dat_bytes: bytes) -> Optional[str]:
+        """
+        Best-effort: find SeriesLOID in Siemens TWIX and extract YYYYMMDD date.
+        Returns YYYYMMDD or None.
+        """
+        txt = dat_bytes.decode("latin-1", errors="ignore")
+
+        # Try common variants
+        m = re.search(r'SeriesLOID"\>\{\s*"([^"]+)"\s*\}', txt)
+        if not m:
+            m = re.search(r"SeriesLOID[^\"\n]*\{\s*\"([^\"]+)\"\s*\}", txt)
+        if not m:
+            m = re.search(r"SeriesLOID[^\"\n]*\"([^\"]+)\"", txt)
+        if not m:
+            return None
+
+        loid = m.group(1)
+
+        # Prefer 14-digit timestamp inside LOID: YYYYMMDDHHMMSS
+        t = re.search(r"(20\d{12})", loid)
+        if t:
+            return t.group(1)[:8]
+
+        # Fallback: any 8-digit date
+        t8 = re.search(r"(20\d{6})", loid) or re.search(r"(\d{8})", loid)
+        return t8.group(1) if t8 else None
+
     if not names:
         flash("No files selected.")
         return redirect(url_for("index"))
@@ -1498,6 +1882,8 @@ def upload():
         toks = toks + [""] * (len(names) - len(toks))
     if len(row_uids) < len(names):
         row_uids = row_uids + [""] * (len(names) - len(row_uids))
+    if len(dat_study_dates) < len(names):
+        dat_study_dates = dat_study_dates + [""] * (len(names) - len(dat_study_dates))
 
     # ------------------------------------------------------------
     # SAFETY: any row missing both token and uid is unmappable
@@ -1607,20 +1993,25 @@ def upload():
     # ------------------------------------------------------------
     row_items: list[dict] = []
     for i, fname in enumerate(names):
+        kind = "dat" if fname.lower().endswith(".dat") else "rda"
         row_items.append({
             "token": (toks[i].strip() if i < len(toks) else ""),
             "uid": (row_uids[i].strip() if i < len(row_uids) else ""),
             "filename": fname,
-            "kind": "dat" if fname.lower().endswith(".dat") else "rda",
+            "kind": kind,
             "scan_id": _to_int_or_none(scans[i]) if i < len(scans) else None,
             "series_desc": (descs[i].strip() if i < len(descs) else ""),
             "project": _sanitize(projs[i]) if i < len(projs) and projs[i].strip() else "",
             "subject": _sanitize(subs[i])  if i < len(subs)  and subs[i].strip()  else "",
             "session": _sanitize(exps[i])  if i < len(exps)  and exps[i].strip()  else "",
             "key": "",  # optional
+            # Persist DAT StudyDate (YYYYMMDD) from the table (hidden input)
+            "dat_study_date": _norm_date8(dat_study_dates[i]) if kind == "dat" else "",
+            # ✅ Persist RDA StudyDate (YYYYMMDD) across failures (filled below from staged RDA)
+            "study_date": "",
         })
 
-    # Save current table state so the user never loses it
+    # Save current table state so the user never loses it (including dat_study_date; study_date filled below)
     session["pending_rows"] = row_items
 
     # ------------------------------------------------------------
@@ -1651,23 +2042,55 @@ def upload():
             "session": row["session"] or e,
             "scan_id": row["scan_id"] if row["scan_id"] is not None else sc,
             "series_desc": row["series_desc"] or hdr.get("SeriesDescription", ""),
-            "study_date": d,
+            "study_date": _norm_date8(d),
         })
 
-    def best_match(dat_name: str, rdas: list[dict]) -> Optional[dict]:
-        base = re.sub(r'[_-]', '', dat_name.lower())
+    # ------------------------------------------------------------
+    # ✅ Copy RDA StudyDate back into row_items so it persists on retry
+    # ------------------------------------------------------------
+    tok_to_rda_date = {
+        r["token"]: _norm_date8(r.get("study_date"))
+        for r in rda_meta
+        if r.get("token")
+    }
+    for row in row_items:
+        if row.get("kind") == "rda":
+            row["study_date"] = tok_to_rda_date.get(row.get("token", ""), "") or ""
+
+    # Optional: refresh snapshot now that study_date is filled
+    session["pending_rows"] = row_items
+
+    def best_match(dat_name: str, dat_date: Optional[str], rdas: list[dict]) -> Optional[dict]:
+        """
+        REQUIRED: StudyDate MUST match to be considered a match.
+        Among RDAs with matching date, pick best by series_desc similarity / scan_id hint.
+        """
+        dat_date = _norm_date8(dat_date)
+        if not dat_date:
+            return None
+
+        base = re.sub(r"[_-]", "", dat_name.lower())
         best = None
+
         for r in rdas:
-            if not r.get("series_desc"):
+            r_date = _norm_date8(r.get("study_date"))
+            if not r_date or r_date != dat_date:
+                continue  # REQUIRED
+
+            desc = (r.get("series_desc") or "")
+            if not desc:
                 continue
-            desc_norm = re.sub(r'[_-]', '', r["series_desc"].lower())
+
+            desc_norm = re.sub(r"[_-]", "", desc.lower())
             score = 0
             if desc_norm in base or base in desc_norm:
                 score += 2
             if r.get("scan_id") is not None and str(r["scan_id"]) in dat_name:
                 score += 3
+
             if score and (not best or score > best[0]):
                 best = (score, r)
+
         return best[1] if best else None
 
     # ------------------------------------------------------------
@@ -1701,37 +2124,47 @@ def upload():
             continue
 
         # Determine metadata for this row
-        meta = None
+        meta: dict = {}
         has_rda_match = False
 
         if row["kind"] == "rda":
-            meta = next((r for r in rda_meta if r["token"] == tok), None)
-            if not meta:
+            meta0 = next((r for r in rda_meta if r["token"] == tok), None)
+            if not meta0:
                 bad.append(f"{name}: Could not parse RDA metadata.")
                 failed_rows.append(row)
                 continue
+            meta = meta0
             has_rda_match = True
+
         else:
-            meta = best_match(name, rda_meta)
-            if meta:
+            # DAT: dat studydate is REQUIRED for matching; prefer persisted table value
+            dat_date = _norm_date8(row.get("dat_study_date"))
+            if not dat_date:
+                dat_date = _norm_date8(_extract_twix_seriesloid_date(blob))
+                if dat_date:
+                    # Persist into row so it survives retry (pending_rows stores row dicts)
+                    row["dat_study_date"] = dat_date
+
+            meta0 = best_match(name, dat_date, rda_meta)
+            if meta0:
+                meta = meta0
                 has_rda_match = True
             else:
                 # No RDA match. That's OK *if the table provides required identifiers*.
                 # We'll proceed using table overrides only.
                 has_rda_match = False
-                meta = {}  # keep downstream code simple
-
+                meta = {}
 
         # Apply table overrides (already sanitized)
         p = row["project"] or meta.get("project") or ""
         s = row["subject"] or meta.get("subject") or ""
         e = row["session"] or meta.get("session") or ""
         sc = row["scan_id"] if row["scan_id"] is not None else meta.get("scan_id")
+
+        # For DICOM validation: only compare StudyDate if we have an RDA match
         d = meta.get("study_date")
-        # If DAT has no RDA match, we can't validate StudyDate against RDA
         if row["kind"] == "dat" and not has_rda_match:
             d = None
-
 
         if not (p and s and e and sc is not None):
             bad.append(f"{name}: Missing required Project/Subject/Session/Scan in the table.")
@@ -1759,7 +2192,6 @@ def upload():
             bad.append(f"{name}: StudyDate mismatch: DICOM={study_dt}, RDA={d}")
             failed_rows.append(row)
             continue
-
 
         # Upload
         base = f"{XNAT_BASE_URL}/data/projects/{p}/subjects/{s}/experiments/{e}/scans/{sc}"
