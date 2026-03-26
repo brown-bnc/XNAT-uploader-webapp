@@ -61,6 +61,9 @@ app = Flask(__name__, instance_relative_config=True)
 # Idle shutdown (auto-stop server when unused)
 # ---------------------------------------------------------------------------
 _last_activity = time.time()
+_active_requests = 0
+_active_lock = threading.Lock()
+_state_lock = threading.Lock()
 
 def _touch_activity() -> None:
     global _last_activity
@@ -68,10 +71,19 @@ def _touch_activity() -> None:
 
 @app.before_request
 def _idle_touch_before_request():
-    # Don't count internal endpoints; optionally ignore static assets too.
-    if request.path in ("/__healthz", "/__shutdown"):
-        return
-    _touch_activity()
+    global _active_requests
+
+    if request.path not in ("/__healthz", "/__shutdown", "/__quit"):
+        _touch_activity()
+
+    with _active_lock:
+        _active_requests += 1
+
+@app.teardown_request
+def _track_request_end(exc):
+    global _active_requests
+    with _active_lock:
+        _active_requests = max(0, _active_requests - 1)
 
 @app.get("/__healthz")
 def __healthz():
@@ -176,7 +188,7 @@ app.config.update(
 app.permanent_session_lifetime = timedelta(minutes=5)
 
 # defaults chosen for large files over VPN/Wi-Fi
-XNAT_HTTP_TIMEOUT = int(os.getenv("XNAT_HTTP_TIMEOUT", "300"))   # seconds
+XNAT_HTTP_TIMEOUT = int(os.getenv("XNAT_HTTP_TIMEOUT", "1800"))   # seconds
 XNAT_HTTP_RETRIES = int(os.getenv("XNAT_HTTP_RETRIES", "3"))     # attempts
 
 # ---------------------------------------------------------------------------
@@ -1439,6 +1451,11 @@ def _init_logging() -> None:
     logdir.mkdir(exist_ok=True)
 
     logfile = logdir / "uploader.log"
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    if any(isinstance(h, RotatingFileHandler) for h in root.handlers):
+        return
 
     handler = RotatingFileHandler(
         logfile,
@@ -1449,9 +1466,6 @@ def _init_logging() -> None:
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     )
-
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
     root.addHandler(handler)
 
 def _stage_dir() -> Path:
@@ -1559,46 +1573,79 @@ def _state_path() -> Path:
     return _session_state_dir() / f"{_get_state_id()}.json"
 
 def _load_server_state() -> dict:
-    p = _state_path()
-    if not p.exists():
-        return {}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        logging.warning("Failed reading session state file: %s", p, exc_info=True)
-        return {}
+    with _state_lock:
+        p = _state_path()
+        if not p.exists():
+            return {}
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            logging.warning("Failed reading session state file: %s", p, exc_info=True)
+            return {}
 
 def _save_server_state(state: dict) -> None:
-    p = _state_path()
-    tmp = p.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-    os.replace(tmp, p)
+    with _state_lock:
+        p = _state_path()
+        tmp = p.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, p)
 
 def _get_server_state_value(key: str, default=None):
     state = _load_server_state()
     return state.get(key, default)
 
 def _set_server_state_value(key: str, value) -> None:
-    state = _load_server_state()
-    state[key] = value
-    _save_server_state(state)
+    with _state_lock:
+        p = _state_path()
+        state = {}
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    state = loaded
+            except Exception:
+                logging.warning("Failed reading session state file: %s", p, exc_info=True)
+
+        state[key] = value
+
+        tmp = p.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, p)
 
 def _pop_server_state_value(key: str, default=None):
-    state = _load_server_state()
-    value = state.pop(key, default)
-    _save_server_state(state)
-    return value
+    with _state_lock:
+        p = _state_path()
+        state = {}
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    state = loaded
+            except Exception:
+                logging.warning("Failed reading session state file: %s", p, exc_info=True)
+
+        value = state.pop(key, default)
+
+        tmp = p.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, p)
+        return value
 
 def _delete_server_state_file() -> None:
-    try:
-        p = _state_path()
-        if p.exists():
-            p.unlink()
-    except Exception:
-        logging.warning("Failed deleting session state file", exc_info=True)
+    with _state_lock:
+        try:
+            p = _state_path()
+            if p.exists():
+                p.unlink()
+        except Exception:
+            logging.warning("Failed deleting session state file", exc_info=True)
 
 _init_logging()
 _cleanup_orphaned_staged_files(max_age_hours=int(os.getenv("STAGED_FILE_MAX_AGE_HOURS", "24")))
@@ -1815,7 +1862,7 @@ def login():
         try:
             js = _xnat_login_jsession(user, pwd, timeout=15)
         except UserFacingError as err:
-            flash(str(err))
+            flash(str(err), "error")
             return render_template_string(LOGIN_HTML, shutdown_token=SHUTDOWN_TOKEN)
 
         session.permanent = True
@@ -2274,8 +2321,10 @@ def start_idle_shutdown_watchdog(host: str, port: int, idle_seconds: int) -> Non
         # Monitor idle time
         while True:
             time.sleep(2)
-            if time.time() - _last_activity > idle_seconds:
-                # _touch_activity()
+            with _active_lock:
+                busy = _active_requests > 0
+
+            if not busy and (time.time() - _last_activity > idle_seconds):
                 try:
                     print("trying to shut down server due to inactivity...")
                     r = requests.post(shutdown, timeout=1.0)
