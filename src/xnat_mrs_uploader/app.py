@@ -431,16 +431,38 @@ UPLOAD_HTML = """
     flex-wrap:wrap;
   }
 
-  .table-wrap { margin-top:1rem; border:1px solid var(--border); border-radius:8px; overflow:hidden; background:#fff; }
-  table.file-table { width:100%; border-collapse:collapse; table-layout:fixed; }
-  table.file-table colgroup col:nth-child(1){width:33%;}
-  table.file-table colgroup col:nth-child(2){width:5%;}
-  table.file-table colgroup col:nth-child(3){width:21%;}
-  table.file-table colgroup col:nth-child(4){width:10%;}
-  table.file-table colgroup col:nth-child(5){width:9%;}
-  table.file-table colgroup col:nth-child(6){width:9%;}
-  table.file-table colgroup col:nth-child(7){width:5%;}
-  table.file-table colgroup col:nth-child(8){width:8%;}
+  .table-wrap {
+    margin-top: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    background: #fff;
+  }
+
+  table.file-table {
+    width: 100%;
+    min-width: 1400px;
+    border-collapse: collapse;
+    table-layout: auto;
+  }
+
+  table.file-table colgroup col:nth-child(1){ width: 430px; } /* Filename */
+  table.file-table colgroup col:nth-child(2){ width: 90px; }  /* Scan ID */
+  table.file-table colgroup col:nth-child(3){ width: 280px; } /* Series Description */
+  table.file-table colgroup col:nth-child(4){ width: 150px; } /* Project */
+  table.file-table colgroup col:nth-child(5){ width: 150px; } /* Subject */
+  table.file-table colgroup col:nth-child(6){ width: 140px; } /* Session */
+  table.file-table colgroup col:nth-child(7){ width: 90px; }  /* Remove */
+  table.file-table colgroup col:nth-child(8){ width: 150px; } /* Upload Error */
+
+  /* prevent weird overflow from inputs */
+  tbody td {
+    min-width: 0;
+  }
+  tbody td input[type=text] {
+    min-width: 0;
+  }
   thead th { text-align:left; background:#f5f7fb; color:#333; padding:.6rem .6rem; border-bottom:1px solid var(--border); font-weight:700; font-size:.8rem; }
   tbody td { border-top:1px solid var(--border); padding:.5rem .5rem; vertical-align:middle; background:#fff; }
   tbody td input[type=text]{ width:100%; padding:.45rem .55rem; border:1px solid #e6e6e6; border-radius:5px; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size:.8rem; }
@@ -1904,7 +1926,11 @@ LAUNCH_HTML = r"""
 
     // Open the real UI as a JS-opened window (closable later).
     // NOTE: must happen synchronously to avoid popup blockers.
-    const child = window.open("/", "xnat_uploader", "popup=yes");
+    const child = window.open(
+      "/",
+      "xnat_uploader",
+      "popup=yes,width=1700,height=950,resizable=yes,scrollbars=yes"
+    );
 
     // If popup blocked, give the user a clickable fallback.
     if (!child) {
