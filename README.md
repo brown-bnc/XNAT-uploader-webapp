@@ -35,5 +35,6 @@ pip install https://github.com/brown-bnc/XNAT-uploader-webapp/archive/refs/tags/
 
 xnat-mrs-uploader
 ```
+---
 
-## This project was supported by grant # NIGMS 5P30GM149405
+# This project was supported by grant # NIGMS 5P30GM149405
